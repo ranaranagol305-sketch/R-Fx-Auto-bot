@@ -53,27 +53,18 @@ from flask import Flask, jsonify, request
 # CONFIGURATION
 # ============================================================================
 
-# Paste your NEW (rotated) TwelveData API keys below — one string per key.
-# Leave this empty and the app will also check the TWELVEDATA_API_KEYS
-# environment variable (comma-separated) as a fallback, so you can set it
-# in Railway instead if you prefer not to keep keys in this file.
 TWELVEDATA_API_KEYS = [
-    # "c47e6aa1e3694d888ba0d8ee10193160",
-    # "5f98e9f032684d27b8b266656bfcadac",
-    # "a592dba7321442efa229bee2b8a1cff8",
-    # "a7def2b8959d4c17a943e21ea1921ac0",
-    # "67b60333dd7c44dea9d268c66d0ec17a",
-    # "0ab3ed6674e1436e8c396c15203479ad",
-    # "411348a610f54662990df7fdd2ebf604",
-    # "87b1d6c795144bf481ec5a02d769b60d",
-    # "7b1cb45d88574c92a867cc95b8a2fba3",
-    # "56df4a80e020400db5259ec9485b2565",
+    "c47e6aa1e3694d888ba0d8ee10193160",
+    "5f98e9f032684d27b8b266656bfcadac",
+    "a592dba7321442efa229bee2b8a1cff8",
+    "a7def2b8959d4c17a943e21ea1921ac0",
+    "67b60333dd7c44dea9d268c66d0ec17a",
+    "0ab3ed6674e1436e8c396c15203479ad",
+    "411348a610f54662990df7fdd2ebf604",
+    "87b1d6c795144bf481ec5a02d769b60d",
+    "7b1cb45d88574c92a867cc95b8a2fba3",
+    "56df4a80e020400db5259ec9485b2565",
 ]
-
-if not TWELVEDATA_API_KEYS:
-    _env_raw = os.environ.get("TWELVEDATA_API_KEYS", "")
-    TWELVEDATA_API_KEYS = [k.strip() for k in _env_raw.split(",") if k.strip()]
-
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com/time_series"
 
 SUPPORTED_PAIRS = {
@@ -107,13 +98,6 @@ _file_handler.setFormatter(_formatter)
 _console_handler.setFormatter(_formatter)
 logger.addHandler(_file_handler)
 logger.addHandler(_console_handler)
-
-if not TWELVEDATA_API_KEYS:
-    logger.warning(
-        "No TWELVEDATA_API_KEYS found in environment variables. "
-        "Set TWELVEDATA_API_KEYS in Railway (comma-separated) before "
-        "generating signals."
-    )
 
 
 # ============================================================================
@@ -870,6 +854,256 @@ def generate_signal():
         "next_candle_time": nxt_time.isoformat(), "last_closed_candle_time": last_candle["datetime"].isoformat(),
         "confirmations": confirmations, "levels": levels,
     })
+
+
+
+# ============================================================================
+# R FX EXTENSION: fixed 1-minute / all-13-pair auto scanner
+# ============================================================================
+_EXTENSION_SCAN_LOCK = threading.Lock()
+
+@app.route("/api/extension/scan", methods=["POST", "OPTIONS"])
+def extension_scan():
+    """
+    Chrome Extension API.
+
+    IMPORTANT:
+    - No account login is required here by design.
+    - Uses the EXISTING strategy functions unchanged:
+        analyze_pair() -> evaluate_confirmations() -> build_signal()
+    - Timeframe is ALWAYS 1 minute.
+    - All 13 supported pairs are scanned.
+    - Only a signal with >= 9/11 votes is considered valid.
+    - The strongest valid pair is returned.
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+
+    server_now = datetime.now(timezone.utc)
+
+    if get_market_status() == "closed":
+        return jsonify({
+            "success": True,
+            "market_status": "closed",
+            "selected": False,
+            "message": "MARKET CLOSED",
+            "display_signal": "WAIT",
+            "pair": None,
+            "timeframe": "1",
+            "timeframe_label": "1 min",
+            "server_time_utc": server_now.isoformat(),
+        }), 200
+
+    if not TWELVEDATA_API_KEYS:
+        return jsonify({
+            "success": False,
+            "market_status": "open",
+            "message": "TwelveData API keys are not configured on Railway.",
+        }), 503
+
+    if not _EXTENSION_SCAN_LOCK.acquire(blocking=False):
+        return jsonify({
+            "success": False,
+            "message": "A scan is already running. Please wait.",
+        }), 429
+
+    try:
+        interval = TIMEFRAME_MAP["1"]
+        best = None
+        results = []
+        errors = []
+
+        # EXACTLY the existing 13-pair list.
+        for pair_label, symbol in SUPPORTED_PAIRS.items():
+            try:
+                (
+                    confirmations,
+                    signal,
+                    confidence,
+                    votes,
+                    candles,
+                    highs,
+                    lows,
+                    closes,
+                ) = analyze_pair(symbol, interval)
+
+            except AllApiKeysExhaustedError as exc:
+                logger.error("Extension scan: all API keys exhausted: %s", exc)
+                return jsonify({
+                    "success": False,
+                    "market_status": "open",
+                    "message": str(exc),
+                    "server_time_utc": datetime.now(timezone.utc).isoformat(),
+                }), 503
+
+            except MarketDataError as exc:
+                errors.append({
+                    "pair": pair_label,
+                    "error": str(exc),
+                })
+                continue
+
+            except Exception as exc:
+                logger.exception(
+                    "Unexpected extension scan error for %s",
+                    pair_label,
+                )
+                errors.append({
+                    "pair": pair_label,
+                    "error": "Unexpected analysis error.",
+                })
+                continue
+
+            valid = (
+                signal in ("BUY", "SELL")
+                and votes >= SIGNAL_VOTE_THRESHOLD
+            )
+
+            display_signal = (
+                "UP" if signal == "BUY"
+                else "DOWN" if signal == "SELL"
+                else "WAIT"
+            )
+
+            last_candle_time = (
+                candles[-1]["datetime"].isoformat()
+                if candles
+                else None
+            )
+
+            results.append({
+                "pair": pair_label,
+                "signal": signal,
+                "display_signal": display_signal,
+                "votes": votes,
+                "total_confirmations": TOTAL_CONFIRMATIONS,
+                "confidence": confidence,
+                "valid": valid,
+                "last_closed_candle_time": last_candle_time,
+            })
+
+            if valid:
+                candidate = (
+                    votes,
+                    confidence,
+                    pair_label,
+                    signal,
+                    confirmations,
+                    candles,
+                    highs,
+                    lows,
+                    closes,
+                    symbol,
+                )
+
+                # Strongest vote count wins.
+                # Confidence is the tie-breaker.
+                if (
+                    best is None
+                    or votes > best[0]
+                    or (
+                        votes == best[0]
+                        and confidence > best[1]
+                    )
+                ):
+                    best = candidate
+
+        scan_time = datetime.now(timezone.utc)
+
+        if best is None:
+            return jsonify({
+                "success": True,
+                "market_status": "open",
+                "selected": False,
+                "message": "WAIT FOR BETTER SETUP",
+                "display_signal": "WAIT",
+                "pair": None,
+                "signal": "WAIT FOR BETTER SETUP",
+                "votes": 0,
+                "total_confirmations": TOTAL_CONFIRMATIONS,
+                "confidence": 0,
+                "timeframe": "1",
+                "timeframe_label": "1 min",
+                "server_time_utc": scan_time.isoformat(),
+                "results": results,
+                "errors": errors,
+            }), 200
+
+        (
+            votes,
+            confidence,
+            pair_label,
+            signal,
+            confirmations,
+            candles,
+            highs,
+            lows,
+            closes,
+            symbol,
+        ) = best
+
+        last_candle = candles[-1]
+        last_closed_candle_time = last_candle["datetime"]
+        next_time = next_candle_time(
+            last_closed_candle_time,
+            interval,
+        )
+
+        display_signal = (
+            "UP" if signal == "BUY"
+            else "DOWN"
+        )
+
+        # Stable ID the extension can use to prevent duplicate trades.
+        signal_key = (
+            f"{pair_label}|"
+            f"{last_closed_candle_time.isoformat()}|"
+            f"{signal}|"
+            f"{votes}"
+        )
+
+        logger.info(
+            "EXTENSION SIGNAL | pair=%s tf=1min signal=%s "
+            "votes=%s/%s confidence=%s candle=%s",
+            pair_label,
+            signal,
+            votes,
+            TOTAL_CONFIRMATIONS,
+            confidence,
+            last_closed_candle_time.isoformat(),
+        )
+
+        return jsonify({
+            "success": True,
+            "market_status": "open",
+            "selected": True,
+            "pair": pair_label,
+            "signal": signal,
+            "display_signal": display_signal,
+            "confidence": confidence,
+            "votes": votes,
+            "total_confirmations": TOTAL_CONFIRMATIONS,
+            "timeframe": "1",
+            "timeframe_label": "1 min",
+            "last_closed_candle_time": last_closed_candle_time.isoformat(),
+            "next_candle_time": next_time.isoformat(),
+            "server_time_utc": scan_time.isoformat(),
+            "signal_key": signal_key,
+            "confirmations": confirmations,
+            "levels": compute_levels(
+                candles,
+                highs,
+                lows,
+                closes,
+                signal,
+                symbol,
+            ),
+            "results": results,
+            "errors": errors,
+        }), 200
+
+    finally:
+        _EXTENSION_SCAN_LOCK.release()
 
 
 @app.errorhandler(404)
