@@ -53,18 +53,27 @@ from flask import Flask, jsonify, request
 # CONFIGURATION
 # ============================================================================
 
+# Paste your NEW (rotated) TwelveData API keys below — one string per key.
+# Leave this empty and the app will also check the TWELVEDATA_API_KEYS
+# environment variable (comma-separated) as a fallback, so you can set it
+# in Railway instead if you prefer not to keep keys in this file.
 TWELVEDATA_API_KEYS = [
-    "c47e6aa1e3694d888ba0d8ee10193160",
-    "5f98e9f032684d27b8b266656bfcadac",
-    "a592dba7321442efa229bee2b8a1cff8",
-    "a7def2b8959d4c17a943e21ea1921ac0",
-    "67b60333dd7c44dea9d268c66d0ec17a",
-    "0ab3ed6674e1436e8c396c15203479ad",
-    "411348a610f54662990df7fdd2ebf604",
-    "87b1d6c795144bf481ec5a02d769b60d",
-    "7b1cb45d88574c92a867cc95b8a2fba3",
-    "56df4a80e020400db5259ec9485b2565",
+    # "c47e6aa1e3694d888ba0d8ee10193160",
+    # "5f98e9f032684d27b8b266656bfcadac",
+    # "a592dba7321442efa229bee2b8a1cff8",
+    # "a7def2b8959d4c17a943e21ea1921ac0",
+    # "67b60333dd7c44dea9d268c66d0ec17a",
+    # "0ab3ed6674e1436e8c396c15203479ad",
+    # "411348a610f54662990df7fdd2ebf604",
+    # "87b1d6c795144bf481ec5a02d769b60d",
+    # "7b1cb45d88574c92a867cc95b8a2fba3",
+    # "56df4a80e020400db5259ec9485b2565",
 ]
+
+if not TWELVEDATA_API_KEYS:
+    _env_raw = os.environ.get("TWELVEDATA_API_KEYS", "")
+    TWELVEDATA_API_KEYS = [k.strip() for k in _env_raw.split(",") if k.strip()]
+
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com/time_series"
 
 SUPPORTED_PAIRS = {
@@ -98,6 +107,13 @@ _file_handler.setFormatter(_formatter)
 _console_handler.setFormatter(_formatter)
 logger.addHandler(_file_handler)
 logger.addHandler(_console_handler)
+
+if not TWELVEDATA_API_KEYS:
+    logger.warning(
+        "No TWELVEDATA_API_KEYS found in environment variables. "
+        "Set TWELVEDATA_API_KEYS in Railway (comma-separated) before "
+        "generating signals."
+    )
 
 
 # ============================================================================
