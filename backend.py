@@ -1,58 +1,25 @@
 """
 R Fx Bot - Backend
-====================
-1) SIGNAL ENGINE
-   Real TwelveData-powered NEXT-CANDLE forex signals using 11 real,
-   mathematically-calculated confirmations, all equal weight:
-   Market Structure, 200 EMA (slope-filtered), 50 EMA (slope-filtered),
-   RSI, MACD, ADX, ATR, Bollinger Bands, Stochastic Oscillator,
-   SuperTrend, Volume.
+Flask + TwelveData real OHLCV data + 11-confirmation strategy engine.
 
-   STRICT RULE: a BUY/SELL signal is only produced when at least 9 of the
-   11 confirmations agree on the same direction (9, 10, or 11 out of 11).
-   8 or fewer agreeing (including ties) is always WAIT FOR BETTER SETUP.
-   No random numbers, no fake confidence, no repainting, no future candle
-   data ever used.
-
-   PAIR MODE: "Single Pair Mode" analyzes only the selected pair.
-   "Auto Scanning Mode" scans all 13 supported pairs and returns a real
-   signal only if at least one pair actually reaches the 9/11 threshold;
-   if none do, the result is WAIT FOR BETTER SETUP (never a forced guess).
-
-2) ACCOUNT SYSTEM
-   Simple email/password accounts. Per explicit requirement, this does NOT
-   use any external database - accounts are kept in the backend process's
-   memory only. Register once, then log back in with the same email and
-   password. Passwords are hashed (never stored in plain text) using
-   PBKDF2-HMAC-SHA256, standard library only.
-
-   Note: because there is no database, accounts are lost if the backend
-   process restarts/redeploys. This is intentional, per requirement.
-
-Run:
-    pip install flask requests
-    python backend.py
+No fake data. No random candles. No forced signals.
 """
 
-import base64
-import hashlib
-import hmac
-import json
-import logging
 import os
-import re
-import secrets
-import threading
 import time
-from datetime import datetime, timedelta, timezone
+import threading
+import hashlib
+from datetime import datetime, timezone
 
 import requests
 from flask import Flask, jsonify, request
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
+# Put your 10 TwelveData API keys here (or set env var TWELVEDATA_API_KEYS
+# as a comma-separated list — that takes priority if present).
 TWELVEDATA_API_KEYS = [
     "c47e6aa1e3694d888ba0d8ee10193160",
     "5f98e9f032684d27b8b266656bfcadac",
@@ -65,248 +32,160 @@ TWELVEDATA_API_KEYS = [
     "7b1cb45d88574c92a867cc95b8a2fba3",
     "56df4a80e020400db5259ec9485b2565",
 ]
-TWELVEDATA_BASE_URL = "https://api.twelvedata.com/time_series"
 
-SUPPORTED_PAIRS = {
-    "XAU/USD": "XAU/USD", "EUR/USD": "EUR/USD", "GBP/USD": "GBP/USD",
-    "USD/JPY": "USD/JPY", "USD/CHF": "USD/CHF", "AUD/USD": "AUD/USD",
-    "NZD/USD": "NZD/USD", "USD/CAD": "USD/CAD", "EUR/JPY": "EUR/JPY",
-    "GBP/JPY": "GBP/JPY", "EUR/GBP": "EUR/GBP", "EUR/AUD": "EUR/AUD",
-    "AUD/JPY": "AUD/JPY",
-}
-TIMEFRAME_MAP = {"1": "1min", "5": "5min", "15": "15min", "30": "30min", "60": "1h"}
-HIGHER_TIMEFRAME_MAP = {"1min": "15min", "5min": "1h", "15min": "4h", "30min": "4h", "1h": "1day"}
-TIMEFRAME_MINUTES = {"1min": 1, "5min": 5, "15min": 15, "30min": 30, "1h": 60, "4h": 240, "1day": 1440}
+env_keys = os.environ.get("TWELVEDATA_API_KEYS")
+if env_keys:
+    TWELVEDATA_API_KEYS = [k.strip() for k in env_keys.split(",") if k.strip()]
 
+TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
+
+PAIRS = [
+    "XAU/USD", "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+    "AUD/USD", "NZD/USD", "USD/CAD", "EUR/JPY", "GBP/JPY",
+    "EUR/GBP", "EUR/AUD", "AUD/JPY",
+]
+
+TIMEFRAME = "1min"
+OUTPUT_SIZE = 260
+MIN_VALID_CANDLES = 210
 TOTAL_CONFIRMATIONS = 11
-SIGNAL_VOTE_THRESHOLD = 9  # out of 11 - 8 or fewer is always WAIT
+MIN_VOTES_TO_TRADE = 9
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "change-this-secret-key-in-railway")
-USER_TOKEN_MAX_AGE_SECONDS = 60 * 60 * 24 * 7  # 7 days
-
-# ============================================================================
-# LOGGING
-# ============================================================================
-
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend.log")
-logger = logging.getLogger("rana_fx_bot")
-logger.setLevel(logging.INFO)
-_file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-_console_handler = logging.StreamHandler()
-_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-_file_handler.setFormatter(_formatter)
-_console_handler.setFormatter(_formatter)
-logger.addHandler(_file_handler)
-logger.addHandler(_console_handler)
+app = Flask(__name__)
 
 
-# ============================================================================
-# PASSWORD HASHING (standard library only - PBKDF2-HMAC-SHA256)
-# ============================================================================
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
 
-PBKDF2_ITERATIONS = 100_000
+# ============================================================
+# API KEY ROTATION
+# ============================================================
 
-
-def hash_password(password):
-    salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), PBKDF2_ITERATIONS)
-    return f"{salt}${digest.hex()}"
-
-
-def verify_password(password, stored_hash):
-    try:
-        salt, digest_hex = stored_hash.split("$")
-        expected = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), PBKDF2_ITERATIONS)
-        return hmac.compare_digest(expected.hex(), digest_hex)
-    except Exception:
-        return False
-
-
-# ============================================================================
-# SIGNED SESSION TOKENS (standard library only - HMAC signed + timestamped)
-# ============================================================================
-
-def create_signed_token(payload_dict):
-    payload_dict = dict(payload_dict)
-    payload_dict["_ts"] = int(time.time())
-    raw = json.dumps(payload_dict, separators=(",", ":")).encode("utf-8")
-    body = base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
-    sig = hmac.new(SECRET_KEY.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
-    return f"{body}.{sig}"
-
-
-def verify_signed_token(token, max_age_seconds):
-    try:
-        body, sig = token.split(".")
-        expected_sig = hmac.new(SECRET_KEY.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected_sig, sig):
-            return None
-        padded = body + "=" * (-len(body) % 4)
-        raw = base64.urlsafe_b64decode(padded.encode("utf-8"))
-        payload = json.loads(raw)
-        if int(time.time()) - payload.get("_ts", 0) > max_age_seconds:
-            return None
-        return payload
-    except Exception:
-        return None
-
-
-def get_bearer_token():
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        return auth_header[7:].strip()
-    return None
-
-
-def require_user_auth():
-    token = get_bearer_token()
-    if not token:
-        return None
-    return verify_signed_token(token, USER_TOKEN_MAX_AGE_SECONDS)
-
-
-# ============================================================================
-# ACCOUNTS - in-memory only, per explicit requirement (no external database)
-# ============================================================================
-
-USERS = {}  # email (lowercase) -> {first_name, last_name, email, mobile, password_hash}
-USERS_LOCK = threading.Lock()
-
-EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-MOBILE_REGEX = re.compile(r"^\+?[0-9\s-]{7,20}$")
-
-
-def is_valid_email(value):
-    return bool(EMAIL_REGEX.match(value or ""))
-
-
-def is_valid_mobile(value):
-    return bool(MOBILE_REGEX.match(value or ""))
-
-
-def is_valid_password(value):
-    if not value or len(value) < 8:
-        return False
-    if not re.search(r"[A-Za-z]", value):
-        return False
-    if not re.search(r"[0-9]", value):
-        return False
-    return True
-
-
-# ============================================================================
-# SIGNAL ENGINE - shared math primitives
-# ============================================================================
-
-class AllApiKeysExhaustedError(Exception):
-    pass
-
-
-class MarketDataError(Exception):
-    pass
-
-
-class ApiKeyManager:
+class KeyRotator:
     def __init__(self, keys):
-        self._keys = list(keys)
-        self._active_index = 0
-        self._exhausted_until = {}
-        self._lock = threading.Lock()
+        self.keys = keys
+        self.index = 0
+        self.exhausted = set()
+        self.lock = threading.Lock()
 
-    def _is_exhausted(self, key):
-        until = self._exhausted_until.get(key)
-        if until is None:
-            return False
-        if datetime.now(timezone.utc) >= until:
-            del self._exhausted_until[key]
-            return False
+    def current(self):
+        with self.lock:
+            if len(self.exhausted) >= len(self.keys):
+                return None
+            return self.keys[self.index]
+
+    def rotate(self):
+        with self.lock:
+            self.exhausted.add(self.keys[self.index])
+            if len(self.exhausted) >= len(self.keys):
+                return None
+            self.index = (self.index + 1) % len(self.keys)
+            while self.keys[self.index] in self.exhausted:
+                self.index = (self.index + 1) % len(self.keys)
+                if len(self.exhausted) >= len(self.keys):
+                    return None
+            return self.keys[self.index]
+
+    def reset_cycle(self):
+        # Called at the start of every fresh scan batch so a previous
+        # exhaustion event doesn't permanently lock the bot out after
+        # TwelveData's per-minute/day limits reset.
+        with self.lock:
+            self.exhausted = set()
+            self.index = 0
+
+
+rotator = KeyRotator(TWELVEDATA_API_KEYS)
+
+# Track last executed signal_key to enforce one-trade-per-candle (server side too)
+_last_signal_keys = {}
+_signal_lock = threading.Lock()
+
+
+def is_key_error(status_code, payload):
+    if status_code == 429:
         return True
-
-    def get_active_key(self):
-        with self._lock:
-            n = len(self._keys)
-            for offset in range(n):
-                idx = (self._active_index + offset) % n
-                key = self._keys[idx]
-                if not self._is_exhausted(key):
-                    self._active_index = idx
-                    return key
-            return None
-
-    def mark_current_exhausted(self, key):
-        with self._lock:
-            self._exhausted_until[key] = datetime.now(timezone.utc) + timedelta(minutes=2)
-            self._active_index = (self._keys.index(key) + 1) % len(self._keys)
-            logger.warning("API key ending in %s marked exhausted, rotating.", key[-4:])
-
-    def status(self):
-        with self._lock:
-            return [{"key_suffix": k[-4:], "exhausted": self._is_exhausted(k)} for k in self._keys]
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        msg = str(payload.get("message", "")).lower()
+        if code in (429, 400, 401, 403):
+            if "credit" in msg or "limit" in msg or "quota" in msg or "api key" in msg:
+                return True
+        if "run out of api credits" in msg or "quota" in msg or "limit" in msg:
+            return True
+    return False
 
 
-api_key_manager = ApiKeyManager(TWELVEDATA_API_KEYS)
+def fetch_candles(pair):
+    """Fetch real OHLCV candles from TwelveData with automatic key rotation.
+    Returns (candles_list, error_string_or_None).
+    candles_list is a list of dicts sorted ASC by time, oldest first.
+    """
+    attempts = 0
+    max_attempts = len(rotator.keys)
 
-
-def fetch_candles(symbol, interval, output_size=260):
-    attempts = len(TWELVEDATA_API_KEYS)
-    last_error = None
-    for _ in range(attempts):
-        key = api_key_manager.get_active_key()
+    while attempts < max_attempts:
+        key = rotator.current()
         if key is None:
-            raise AllApiKeysExhaustedError("All TwelveData API keys have reached their request limit.")
-        params = {"symbol": symbol, "interval": interval, "outputsize": output_size, "apikey": key, "order": "ASC"}
+            return None, "ALL TWELVEDATA API KEYS EXHAUSTED"
+
+        params = {
+            "symbol": pair,
+            "interval": TIMEFRAME,
+            "outputsize": OUTPUT_SIZE,
+            "apikey": key,
+            "order": "ASC",
+        }
+
         try:
-            resp = requests.get(TWELVEDATA_BASE_URL, params=params, timeout=15)
-        except requests.RequestException as exc:
-            raise MarketDataError(f"Network error contacting market data provider: {exc}")
+            resp = requests.get(TWELVEDATA_URL, params=params, timeout=15)
+        except requests.RequestException as e:
+            return None, f"API ERROR: {e}"
+
         try:
-            payload = resp.json()
+            data = resp.json()
         except ValueError:
-            raise MarketDataError("Invalid JSON response from TwelveData")
-        if payload.get("status") == "error":
-            message = str(payload.get("message", "")).lower()
-            code = payload.get("code")
-            if code == 429 or "credit" in message or "limit" in message:
-                api_key_manager.mark_current_exhausted(key)
-                last_error = payload.get("message")
+            return None, "API ERROR: invalid response"
+
+        if isinstance(data, dict) and data.get("status") == "error":
+            if is_key_error(resp.status_code, data):
+                attempts += 1
+                nxt = rotator.rotate()
+                if nxt is None:
+                    return None, "ALL TWELVEDATA API KEYS EXHAUSTED"
                 continue
-            raise MarketDataError(payload.get("message", "Unknown TwelveData error"))
-        values = payload.get("values")
+            return None, f"API ERROR: {data.get('message', 'unknown error')}"
+
+        values = data.get("values") if isinstance(data, dict) else None
         if not values:
-            raise MarketDataError("TwelveData returned no candle data for this symbol/interval.")
+            return None, "API ERROR: no data returned"
+
         candles = []
-        for row in values:
+        for v in values:
             try:
-                dt_str = row["datetime"]
-                candle_dt = (
-                    datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    if len(dt_str) > 10 else
-                    datetime.strptime(dt_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                )
                 candles.append({
-                    "datetime": candle_dt, "open": float(row["open"]), "high": float(row["high"]),
-                    "low": float(row["low"]), "close": float(row["close"]),
-                    "volume": float(row["volume"]) if row.get("volume") not in (None, "") else 0.0,
+                    "time": v["datetime"],
+                    "open": float(v["open"]),
+                    "high": float(v["high"]),
+                    "low": float(v["low"]),
+                    "close": float(v["close"]),
+                    "volume": float(v["volume"]) if v.get("volume") not in (None, "") else None,
                 })
             except (KeyError, ValueError):
-                pass
-        candles.sort(key=lambda c: c["datetime"])
-        return candles
-    raise AllApiKeysExhaustedError(last_error or "All TwelveData API keys are exhausted.")
+                continue
+
+        return candles, None
+
+    return None, "ALL TWELVEDATA API KEYS EXHAUSTED"
 
 
-def get_market_status():
-    now = datetime.now(timezone.utc)
-    weekday = now.weekday()
-    hour = now.hour
-    if weekday == 5:
-        return "closed"
-    if weekday == 4 and hour >= 22:
-        return "closed"
-    if weekday == 6 and hour < 22:
-        return "closed"
-    return "open"
-
+# ============================================================
+# INDICATOR MATH (pure python, no numpy/pandas)
+# ============================================================
 
 def sma(values, period):
     out = [None] * len(values)
@@ -317,75 +196,91 @@ def sma(values, period):
 
 def ema(values, period):
     out = [None] * len(values)
-    if len(values) < period:
+    k = 2 / (period + 1)
+    seed_idx = period - 1
+    if seed_idx >= len(values):
         return out
-    seed = sum(values[:period]) / period
-    out[period - 1] = seed
-    multiplier = 2 / (period + 1)
-    for i in range(period, len(values)):
-        out[i] = (values[i] - out[i - 1]) * multiplier + out[i - 1]
+    seed = sum(values[0:period]) / period
+    out[seed_idx] = seed
+    for i in range(seed_idx + 1, len(values)):
+        out[i] = values[i] * k + out[i - 1] * (1 - k)
     return out
 
 
 def rsi(closes, period=14):
     out = [None] * len(closes)
-    if len(closes) <= period:
+    if len(closes) < period + 1:
         return out
     gains, losses = [], []
     for i in range(1, len(closes)):
         change = closes[i] - closes[i - 1]
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    out[period] = _rsi_from_avgs(avg_gain, avg_loss)
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+
+    avg_gain = sum(gains[0:period]) / period
+    avg_loss = sum(losses[0:period]) / period
+    idx = period  # index in closes corresponding to first RSI value
+    rs = avg_gain / avg_loss if avg_loss != 0 else float("inf")
+    out[idx] = 100 - (100 / (1 + rs)) if avg_loss != 0 else 100
+
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        out[i + 1] = _rsi_from_avgs(avg_gain, avg_loss)
+        rs = avg_gain / avg_loss if avg_loss != 0 else float("inf")
+        out[i + 1] = 100 - (100 / (1 + rs)) if avg_loss != 0 else 100
+
     return out
 
 
-def _rsi_from_avgs(avg_gain, avg_loss):
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def macd(closes, fast=12, slow=26, signal=9):
+def macd(closes, fast=12, slow=26, signal_period=9):
     ema_fast = ema(closes, fast)
     ema_slow = ema(closes, slow)
-    macd_line = [(f - s) if (f is not None and s is not None) else None for f, s in zip(ema_fast, ema_slow)]
-    first_valid = next((i for i, v in enumerate(macd_line) if v is not None), None)
+    macd_line = [None] * len(closes)
+    for i in range(len(closes)):
+        if ema_fast[i] is not None and ema_slow[i] is not None:
+            macd_line[i] = ema_fast[i] - ema_slow[i]
+
+    clean = [v for v in macd_line if v is not None]
+    signal_clean = ema(clean, signal_period)
     signal_line = [None] * len(closes)
-    histogram = [None] * len(closes)
-    if first_valid is not None:
-        valid_macd = macd_line[first_valid:]
-        sig = ema(valid_macd, signal)
-        for i, v in enumerate(sig):
-            if v is not None:
-                signal_line[first_valid + i] = v
-                histogram[first_valid + i] = valid_macd[i] - v
-    return macd_line, signal_line, histogram
+    offset = len(closes) - len(clean)
+    for i, v in enumerate(signal_clean):
+        if v is not None:
+            signal_line[offset + i] = v
+
+    hist = [None] * len(closes)
+    for i in range(len(closes)):
+        if macd_line[i] is not None and signal_line[i] is not None:
+            hist[i] = macd_line[i] - signal_line[i]
+
+    return macd_line, signal_line, hist
 
 
 def true_range(highs, lows, closes):
-    tr = [None] * len(closes)
-    tr[0] = highs[0] - lows[0]
+    out = [None] * len(closes)
+    out[0] = highs[0] - lows[0]
     for i in range(1, len(closes)):
-        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
-    return tr
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        out[i] = tr
+    return out
 
 
 def wilder_smooth(values, period):
     out = [None] * len(values)
-    if len(values) < period:
+    valid = [v for v in values if v is not None]
+    if len(valid) < period:
         return out
-    seed = sum(values[:period]) / period
-    out[period - 1] = seed
-    for i in range(period, len(values)):
-        out[i] = (out[i - 1] * (period - 1) + values[i]) / period
+    start = next(i for i, v in enumerate(values) if v is not None)
+    first = sum(values[start:start + period]) / period
+    out[start + period - 1] = first
+    prev = first
+    for i in range(start + period, len(values)):
+        prev = (prev * (period - 1) + values[i]) / period
+        out[i] = prev
     return out
 
 
@@ -403,721 +298,455 @@ def adx(highs, lows, closes, period=14):
         down_move = lows[i - 1] - lows[i]
         plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
         minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
+
     tr = true_range(highs, lows, closes)
-    smoothed_tr = wilder_smooth(tr, period)
-    smoothed_plus_dm = wilder_smooth(plus_dm, period)
-    smoothed_minus_dm = wilder_smooth(minus_dm, period)
+    atr_smooth = wilder_smooth(tr, period)
+    plus_dm_smooth = wilder_smooth(plus_dm, period)
+    minus_dm_smooth = wilder_smooth(minus_dm, period)
+
     plus_di = [None] * n
     minus_di = [None] * n
+    for i in range(n):
+        if atr_smooth[i] not in (None, 0) and plus_dm_smooth[i] is not None:
+            plus_di[i] = 100 * plus_dm_smooth[i] / atr_smooth[i]
+        if atr_smooth[i] not in (None, 0) and minus_dm_smooth[i] is not None:
+            minus_di[i] = 100 * minus_dm_smooth[i] / atr_smooth[i]
+
     dx = [None] * n
     for i in range(n):
-        if smoothed_tr[i] and smoothed_plus_dm[i] is not None and smoothed_minus_dm[i] is not None and smoothed_tr[i] != 0:
-            plus_di[i] = 100 * smoothed_plus_dm[i] / smoothed_tr[i]
-            minus_di[i] = 100 * smoothed_minus_dm[i] / smoothed_tr[i]
+        if plus_di[i] is not None and minus_di[i] is not None:
             denom = plus_di[i] + minus_di[i]
-            dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / denom if denom != 0 else 0.0
-    first_dx = next((i for i, v in enumerate(dx) if v is not None), None)
-    adx_line = [None] * n
-    if first_dx is not None:
-        valid_dx = [v for v in dx[first_dx:] if v is not None]
-        smoothed = wilder_smooth(valid_dx, period)
-        for i, v in enumerate(smoothed):
-            if v is not None:
-                adx_line[first_dx + i] = v
+            if denom != 0:
+                dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / denom
+
+    adx_line = wilder_smooth(dx, period)
     return adx_line, plus_di, minus_di
 
 
-def bollinger_bands(closes, period=20, num_std=2):
-    middle = sma(closes, period)
+def bollinger(closes, period=20, mult=2):
+    mid = sma(closes, period)
     upper = [None] * len(closes)
     lower = [None] * len(closes)
     for i in range(period - 1, len(closes)):
         window = closes[i - period + 1:i + 1]
-        mean = middle[i]
-        variance = sum((x - mean) ** 2 for x in window) / period
-        std = variance ** 0.5
-        upper[i] = mean + num_std * std
-        lower[i] = mean - num_std * std
-    return upper, middle, lower
+        mean = mid[i]
+        variance = sum((c - mean) ** 2 for c in window) / period
+        sd = variance ** 0.5
+        upper[i] = mean + mult * sd
+        lower[i] = mean - mult * sd
+    return upper, mid, lower
 
 
-def stochastic_oscillator(highs, lows, closes, k_period=14, d_period=3):
+def stochastic(highs, lows, closes, k_period=14, d_period=3):
     n = len(closes)
-    k_values = [None] * n
+    k = [None] * n
     for i in range(k_period - 1, n):
         window_high = max(highs[i - k_period + 1:i + 1])
         window_low = min(lows[i - k_period + 1:i + 1])
-        if window_high - window_low == 0:
-            k_values[i] = 50.0
+        if window_high == window_low:
+            k[i] = 50.0
         else:
-            k_values[i] = 100 * (closes[i] - window_low) / (window_high - window_low)
-    d_values = [None] * n
-    for i in range(n):
-        window = [k_values[j] for j in range(max(0, i - d_period + 1), i + 1) if k_values[j] is not None]
-        if len(window) == d_period:
-            d_values[i] = sum(window) / d_period
-    return k_values, d_values
+            k[i] = 100 * (closes[i] - window_low) / (window_high - window_low)
+
+    clean = [v for v in k if v is not None]
+    d_clean = sma(clean, d_period)
+    d = [None] * n
+    offset = n - len(clean)
+    for i, v in enumerate(d_clean):
+        if v is not None:
+            d[offset + i] = v
+
+    return k, d
 
 
-def supertrend(highs, lows, closes, period=10, multiplier=3.0):
+def supertrend(highs, lows, closes, period=10, mult=3):
     n = len(closes)
-    atr_values = atr(highs, lows, closes, period)
+    atr_vals = atr(highs, lows, closes, period)
     hl2 = [(highs[i] + lows[i]) / 2 for i in range(n)]
-    final_upper = [None] * n
-    final_lower = [None] * n
-    trend = [None] * n
+
+    upperband = [None] * n
+    lowerband = [None] * n
+    trend = [None] * n  # 1 = up, -1 = down
+
     for i in range(n):
-        if atr_values[i] is None:
+        if atr_vals[i] is None:
             continue
-        basic_upper = hl2[i] + multiplier * atr_values[i]
-        basic_lower = hl2[i] - multiplier * atr_values[i]
-        prev_final_upper = final_upper[i - 1] if i > 0 else None
-        prev_final_lower = final_lower[i - 1] if i > 0 else None
-        final_upper[i] = (basic_upper if (prev_final_upper is None or basic_upper < prev_final_upper or closes[i - 1] > prev_final_upper) else prev_final_upper)
-        final_lower[i] = (basic_lower if (prev_final_lower is None or basic_lower > prev_final_lower or closes[i - 1] < prev_final_lower) else prev_final_lower)
-        if i == 0 or trend[i - 1] is None:
-            trend[i] = "up" if closes[i] > final_upper[i] else "down"
-        elif trend[i - 1] == "up":
-            trend[i] = "down" if closes[i] < final_lower[i] else "up"
+        basic_upper = hl2[i] + mult * atr_vals[i]
+        basic_lower = hl2[i] - mult * atr_vals[i]
+
+        prev_upper = upperband[i - 1] if i > 0 else None
+        prev_lower = lowerband[i - 1] if i > 0 else None
+        prev_close = closes[i - 1] if i > 0 else None
+
+        if prev_upper is not None:
+            final_upper = basic_upper if (basic_upper < prev_upper or prev_close > prev_upper) else prev_upper
         else:
-            trend[i] = "up" if closes[i] > final_upper[i] else "down"
+            final_upper = basic_upper
+
+        if prev_lower is not None:
+            final_lower = basic_lower if (basic_lower > prev_lower or prev_close < prev_lower) else prev_lower
+        else:
+            final_lower = basic_lower
+
+        upperband[i] = final_upper
+        lowerband[i] = final_lower
+
+        prev_trend = trend[i - 1] if i > 0 else None
+        if prev_trend is None:
+            trend[i] = 1 if closes[i] > final_upper else -1
+        elif prev_trend == 1:
+            trend[i] = -1 if closes[i] < final_lower else 1
+        else:
+            trend[i] = 1 if closes[i] > final_upper else -1
+
     return trend
 
 
-def find_swing_points(highs, lows, window=3):
+def swing_points(highs, lows, left=2, right=2):
+    """Return list of (index, 'high'/'low', price) for confirmed swing points."""
     n = len(highs)
-    swing_highs, swing_lows = [], []
-    for i in range(window, n - window):
-        left_h, right_h = highs[i - window:i], highs[i + 1:i + 1 + window]
-        if highs[i] >= max(left_h) and highs[i] >= max(right_h):
-            swing_highs.append((i, highs[i]))
-        left_l, right_l = lows[i - window:i], lows[i + 1:i + 1 + window]
-        if lows[i] <= min(left_l) and lows[i] <= min(right_l):
-            swing_lows.append((i, lows[i]))
-    return swing_highs, swing_lows
+    points = []
+    for i in range(left, n - right):
+        window_high = highs[i - left:i + right + 1]
+        window_low = lows[i - left:i + right + 1]
+        if highs[i] == max(window_high) and window_high.count(highs[i]) == 1:
+            points.append((i, "high", highs[i]))
+        if lows[i] == min(window_low) and window_low.count(lows[i]) == 1:
+            points.append((i, "low", lows[i]))
+    return points
 
 
-# ============================================================================
-# CONFIRMATION / SIGNAL ENGINE - 11 equal-weight confirmations
-# ============================================================================
+def market_structure(highs, lows):
+    points = swing_points(highs, lows)
+    swing_highs = [p for p in points if p[1] == "high"]
+    swing_lows = [p for p in points if p[1] == "low"]
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return "NEUTRAL"
 
-def evaluate_confirmations(highs, lows, closes, volumes):
+    last_high, prev_high = swing_highs[-1][2], swing_highs[-2][2]
+    last_low, prev_low = swing_lows[-1][2], swing_lows[-2][2]
+
+    if last_high > prev_high and last_low > prev_low:
+        return "BUY"
+    if last_high < prev_high and last_low < prev_low:
+        return "SELL"
+    return "NEUTRAL"
+
+
+# ============================================================
+# STRATEGY: 11 confirmations, equal weight, >=9/11 to trade
+# ============================================================
+
+def evaluate_pair(pair, candles):
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    volumes = [c["volume"] for c in candles]
+
     n = len(closes)
-    last = n - 1
-    confirmations = {}
+    votes = {}
 
     # 1. Market Structure
-    swing_highs, swing_lows = find_swing_points(highs, lows, window=3)
-    recent_highs = [p for _, p in swing_highs[-3:]]
-    recent_lows = [p for _, p in swing_lows[-3:]]
-    if len(recent_highs) >= 2 and len(recent_lows) >= 2:
-        hh = recent_highs[-1] > recent_highs[-2]
-        hl = recent_lows[-1] > recent_lows[-2]
-        lh = recent_highs[-1] < recent_highs[-2]
-        ll = recent_lows[-1] < recent_lows[-2]
-        confirmations["Market Structure"] = "BUY" if (hh and hl) else ("SELL" if (lh and ll) else "NEUTRAL")
-    else:
-        confirmations["Market Structure"] = "NEUTRAL"
+    votes["market_structure"] = market_structure(highs, lows)
 
-    # 2. 200 EMA (slope-filtered)
+    # 2. 200 EMA slope filtered
     ema200 = ema(closes, 200)
-    if ema200[last] is not None and last >= 5 and ema200[last - 5] is not None:
-        price = closes[last]
-        if price > ema200[last] and ema200[last] > ema200[last - 5]:
-            confirmations["200 EMA"] = "BUY"
-        elif price < ema200[last] and ema200[last] < ema200[last - 5]:
-            confirmations["200 EMA"] = "SELL"
+    if ema200[-1] is not None and ema200[-2] is not None:
+        price = closes[-1]
+        rising = ema200[-1] > ema200[-2]
+        falling = ema200[-1] < ema200[-2]
+        if price > ema200[-1] and rising:
+            votes["ema200"] = "BUY"
+        elif price < ema200[-1] and falling:
+            votes["ema200"] = "SELL"
         else:
-            confirmations["200 EMA"] = "NEUTRAL"
+            votes["ema200"] = "NEUTRAL"
     else:
-        confirmations["200 EMA"] = "NEUTRAL"
+        votes["ema200"] = "NEUTRAL"
 
-    # 3. 50 EMA (slope-filtered)
+    # 3. 50 EMA slope filtered
     ema50 = ema(closes, 50)
-    if ema50[last] is not None and last >= 3 and ema50[last - 3] is not None:
-        price = closes[last]
-        if price > ema50[last] and ema50[last] > ema50[last - 3]:
-            confirmations["50 EMA"] = "BUY"
-        elif price < ema50[last] and ema50[last] < ema50[last - 3]:
-            confirmations["50 EMA"] = "SELL"
+    if ema50[-1] is not None and ema50[-2] is not None:
+        price = closes[-1]
+        rising = ema50[-1] > ema50[-2]
+        falling = ema50[-1] < ema50[-2]
+        if price > ema50[-1] and rising:
+            votes["ema50"] = "BUY"
+        elif price < ema50[-1] and falling:
+            votes["ema50"] = "SELL"
         else:
-            confirmations["50 EMA"] = "NEUTRAL"
+            votes["ema50"] = "NEUTRAL"
     else:
-        confirmations["50 EMA"] = "NEUTRAL"
+        votes["ema50"] = "NEUTRAL"
 
     # 4. RSI
-    rsi_values = rsi(closes, 14)
-    if rsi_values[last] is not None and rsi_values[last - 1] is not None:
-        r, r_prev = rsi_values[last], rsi_values[last - 1]
-        confirmations["RSI"] = "BUY" if (r > 55 and r >= r_prev) else ("SELL" if (r < 45 and r <= r_prev) else "NEUTRAL")
+    rsi_vals = rsi(closes, 14)
+    if rsi_vals[-1] is not None and rsi_vals[-2] is not None:
+        r, prev_r = rsi_vals[-1], rsi_vals[-2]
+        if r > 55 and r >= prev_r:
+            votes["rsi"] = "BUY"
+        elif r < 45 and r <= prev_r:
+            votes["rsi"] = "SELL"
+        else:
+            votes["rsi"] = "NEUTRAL"
     else:
-        confirmations["RSI"] = "NEUTRAL"
+        votes["rsi"] = "NEUTRAL"
 
     # 5. MACD
     macd_line, signal_line, hist = macd(closes)
-    if macd_line[last] is not None and signal_line[last] is not None:
-        if macd_line[last] > signal_line[last] and hist[last] > 0:
-            confirmations["MACD"] = "BUY"
-        elif macd_line[last] < signal_line[last] and hist[last] < 0:
-            confirmations["MACD"] = "SELL"
+    if macd_line[-1] is not None and signal_line[-1] is not None and hist[-1] is not None:
+        if macd_line[-1] > signal_line[-1] and hist[-1] > 0:
+            votes["macd"] = "BUY"
+        elif macd_line[-1] < signal_line[-1] and hist[-1] < 0:
+            votes["macd"] = "SELL"
         else:
-            confirmations["MACD"] = "NEUTRAL"
+            votes["macd"] = "NEUTRAL"
     else:
-        confirmations["MACD"] = "NEUTRAL"
+        votes["macd"] = "NEUTRAL"
 
     # 6. ADX
     adx_line, plus_di, minus_di = adx(highs, lows, closes, 14)
-    if adx_line[last] is not None and plus_di[last] is not None and minus_di[last] is not None:
-        if adx_line[last] >= 20 and plus_di[last] > minus_di[last]:
-            confirmations["ADX"] = "BUY"
-        elif adx_line[last] >= 20 and minus_di[last] > plus_di[last]:
-            confirmations["ADX"] = "SELL"
+    if adx_line[-1] is not None and plus_di[-1] is not None and minus_di[-1] is not None:
+        if adx_line[-1] >= 20 and plus_di[-1] > minus_di[-1]:
+            votes["adx"] = "BUY"
+        elif adx_line[-1] >= 20 and minus_di[-1] > plus_di[-1]:
+            votes["adx"] = "SELL"
         else:
-            confirmations["ADX"] = "NEUTRAL"
+            votes["adx"] = "NEUTRAL"
     else:
-        confirmations["ADX"] = "NEUTRAL"
+        votes["adx"] = "NEUTRAL"
 
-    # 7. ATR (breakout momentum)
-    atr_values = atr(highs, lows, closes, 14)
-    if atr_values[last] is not None and atr_values[last] > 0:
-        move = closes[last] - closes[last - 1]
-        confirmations["ATR"] = "BUY" if move > 0.5 * atr_values[last] else ("SELL" if move < -0.5 * atr_values[last] else "NEUTRAL")
+    # 7. ATR (movement filter)
+    atr_vals = atr(highs, lows, closes, 14)
+    if atr_vals[-1] is not None and n >= 2:
+        move = closes[-1] - closes[-2]
+        if move > 0.5 * atr_vals[-1]:
+            votes["atr"] = "BUY"
+        elif move < -0.5 * atr_vals[-1]:
+            votes["atr"] = "SELL"
+        else:
+            votes["atr"] = "NEUTRAL"
     else:
-        confirmations["ATR"] = "NEUTRAL"
+        votes["atr"] = "NEUTRAL"
 
     # 8. Bollinger Bands
-    upper, middle, lower = bollinger_bands(closes, 20, 2)
-    if middle[last] is not None:
-        if closes[last] > middle[last] and closes[last] < upper[last]:
-            confirmations["Bollinger Bands"] = "BUY"
-        elif closes[last] < middle[last] and closes[last] > lower[last]:
-            confirmations["Bollinger Bands"] = "SELL"
+    bb_upper, bb_mid, bb_lower = bollinger(closes, 20, 2)
+    if bb_upper[-1] is not None and bb_mid[-1] is not None and bb_lower[-1] is not None:
+        c = closes[-1]
+        if c > bb_mid[-1] and c < bb_upper[-1]:
+            votes["bollinger"] = "BUY"
+        elif c < bb_mid[-1] and c > bb_lower[-1]:
+            votes["bollinger"] = "SELL"
         else:
-            confirmations["Bollinger Bands"] = "NEUTRAL"
+            votes["bollinger"] = "NEUTRAL"
     else:
-        confirmations["Bollinger Bands"] = "NEUTRAL"
+        votes["bollinger"] = "NEUTRAL"
 
-    # 9. Stochastic Oscillator
-    k_values, d_values = stochastic_oscillator(highs, lows, closes, 14, 3)
-    if k_values[last] is not None and d_values[last] is not None:
-        if k_values[last] > d_values[last] and k_values[last] < 80:
-            confirmations["Stochastic"] = "BUY"
-        elif k_values[last] < d_values[last] and k_values[last] > 20:
-            confirmations["Stochastic"] = "SELL"
+    # 9. Stochastic
+    stoch_k, stoch_d = stochastic(highs, lows, closes, 14, 3)
+    if stoch_k[-1] is not None and stoch_d[-1] is not None:
+        k, d = stoch_k[-1], stoch_d[-1]
+        if k > d and k < 80:
+            votes["stochastic"] = "BUY"
+        elif k < d and k > 20:
+            votes["stochastic"] = "SELL"
         else:
-            confirmations["Stochastic"] = "NEUTRAL"
+            votes["stochastic"] = "NEUTRAL"
     else:
-        confirmations["Stochastic"] = "NEUTRAL"
+        votes["stochastic"] = "NEUTRAL"
 
     # 10. SuperTrend
-    st_trend = supertrend(highs, lows, closes, 10, 3.0)
-    if st_trend[last] == "up":
-        confirmations["SuperTrend"] = "BUY"
-    elif st_trend[last] == "down":
-        confirmations["SuperTrend"] = "SELL"
+    st = supertrend(highs, lows, closes, 10, 3)
+    if st[-1] == 1:
+        votes["supertrend"] = "BUY"
+    elif st[-1] == -1:
+        votes["supertrend"] = "SELL"
     else:
-        confirmations["SuperTrend"] = "NEUTRAL"
+        votes["supertrend"] = "NEUTRAL"
 
     # 11. Volume
-    if volumes and len(volumes) == n and any(v > 0 for v in volumes[-30:]):
-        recent_vols = [v for v in volumes[-21:-1] if v is not None]
-        avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 0
-        current_vol = volumes[last]
-        price_up = closes[last] > closes[last - 1]
-        confirmations["Volume"] = ("BUY" if price_up else "SELL") if (avg_vol > 0 and current_vol > avg_vol) else "NEUTRAL"
+    usable_volume = all(v is not None and v > 0 for v in volumes[-21:]) if n >= 21 else False
+    if usable_volume:
+        avg_vol = sum(volumes[-21:-1]) / 20
+        cur_vol = volumes[-1]
+        price_up = closes[-1] > closes[-2]
+        price_down = closes[-1] < closes[-2]
+        if cur_vol > avg_vol and price_up:
+            votes["volume"] = "BUY"
+        elif cur_vol > avg_vol and price_down:
+            votes["volume"] = "SELL"
+        else:
+            votes["volume"] = "NEUTRAL"
     else:
-        confirmations["Volume"] = "NEUTRAL"
+        votes["volume"] = "NEUTRAL"
 
-    return confirmations
+    buy_votes = sum(1 for v in votes.values() if v == "BUY")
+    sell_votes = sum(1 for v in votes.values() if v == "SELL")
+
+    if buy_votes >= MIN_VOTES_TO_TRADE and buy_votes > sell_votes:
+        direction = "BUY"
+        vote_count = buy_votes
+    elif sell_votes >= MIN_VOTES_TO_TRADE and sell_votes > buy_votes:
+        direction = "SELL"
+        vote_count = sell_votes
+    else:
+        direction = "WAIT"
+        vote_count = max(buy_votes, sell_votes)
+
+    confidence = round((vote_count / TOTAL_CONFIRMATIONS) * 100, 1)
+
+    return {
+        "pair": pair,
+        "direction": direction,
+        "votes": vote_count,
+        "buy_votes": buy_votes,
+        "sell_votes": sell_votes,
+        "confidence": confidence,
+        "confirmations": votes,
+        "last_closed_candle_time": candles[-1]["time"],
+    }
 
 
-def build_signal(confirmations):
-    """
-    STRICT equal-weight rule: every one of the 11 confirmations counts the
-    same, none is mandatory. A BUY or SELL is only produced when at least
-    SIGNAL_VOTE_THRESHOLD (9) of the 11 agree on the same direction.
-    8 or fewer (including ties) always resolves to WAIT FOR BETTER SETUP.
-    """
-    buy_votes = sum(1 for v in confirmations.values() if v == "BUY")
-    sell_votes = sum(1 for v in confirmations.values() if v == "SELL")
-
-    dominant = "BUY" if buy_votes >= sell_votes else "SELL"
-    votes = buy_votes if dominant == "BUY" else sell_votes
-    confidence = round((votes / TOTAL_CONFIRMATIONS) * 100, 1)
-
-    if votes >= SIGNAL_VOTE_THRESHOLD:
-        return dominant, confidence, votes
-    return "WAIT FOR BETTER SETUP", confidence, votes
+def make_signal_key(pair, candle_time, direction, votes):
+    raw = f"{pair}|{candle_time}|{direction}|{votes}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def next_candle_time(last_candle_time, interval):
-    minutes = TIMEFRAME_MINUTES.get(interval, 1)
-    return last_candle_time + timedelta(minutes=minutes)
-
-
-def compute_levels(candles, highs, lows, closes, signal, symbol):
-    decimals = 3 if "JPY" in symbol else (2 if "XAU" in symbol else 5)
-    entry_price = round(candles[-1]["close"], decimals)
-    atr_values = atr(highs, lows, closes, 14)
-    current_atr = atr_values[-1]
-    if not current_atr or ("BUY" not in signal and "SELL" not in signal):
+def next_candle_time_str(last_closed_time):
+    try:
+        dt = datetime.strptime(last_closed_time, "%Y-%m-%d %H:%M:%S")
+        nxt = dt.replace(second=0) 
+        nxt = nxt.timestamp() + 60
+        return datetime.fromtimestamp(nxt, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
         return None
-    direction = "BUY" if "BUY" in signal else "SELL"
-    if direction == "BUY":
-        return {"entry": entry_price, "tp1": round(entry_price + current_atr, decimals),
-                "tp2": round(entry_price + current_atr * 2, decimals), "sl": round(entry_price - current_atr * 1.5, decimals)}
-    return {"entry": entry_price, "tp1": round(entry_price - current_atr, decimals),
-            "tp2": round(entry_price - current_atr * 2, decimals), "sl": round(entry_price + current_atr * 1.5, decimals)}
 
 
-def analyze_pair(symbol, interval):
-    candles = fetch_candles(symbol, interval, output_size=260)
-    if len(candles) < 210:
-        raise MarketDataError("Not enough historical data for this pair.")
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-    closes = [c["close"] for c in candles]
-    volumes = [c["volume"] for c in candles]
-    confirmations = evaluate_confirmations(highs, lows, closes, volumes)
-    signal, confidence, votes = build_signal(confirmations)
-    return confirmations, signal, confidence, votes, candles, highs, lows, closes
+# ============================================================
+# MARKET STATUS
+# ============================================================
+
+def get_market_status():
+    """Forex-style market: closed roughly Fri 22:00 UTC -> Sun 22:00 UTC."""
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()  # Mon=0 ... Sun=6
+    hour = now.hour
+
+    if weekday == 5:  # Saturday
+        return "closed"
+    if weekday == 6 and hour < 22:  # Sunday before 22:00 UTC
+        return "closed"
+    if weekday == 4 and hour >= 22:  # Friday after 22:00 UTC
+        return "closed"
+    return "open"
 
 
-# ============================================================================
-# FLASK APP
-# ============================================================================
-
-app = Flask(__name__)
-
-
-@app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    return response
-
+# ============================================================
+# ROUTES
+# ============================================================
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
-
-
-@app.route("/api/pairs", methods=["GET"])
-def get_pairs():
-    return jsonify({"pairs": list(SUPPORTED_PAIRS.keys())})
+    return jsonify({"status": "ok", "service": "R Fx Bot"})
 
 
 @app.route("/api/market-status", methods=["GET"])
 def market_status():
-    return jsonify({"status": get_market_status(), "server_time_utc": datetime.now(timezone.utc).isoformat()})
-
-
-# ----------------------------------------------------------------------------
-# ACCOUNT SYSTEM ROUTES  (in-memory only, no database, no Google, no email verification)
-# ----------------------------------------------------------------------------
-
-@app.route("/api/register", methods=["POST", "OPTIONS"])
-def register():
-    if request.method == "OPTIONS":
-        return "", 200
-
-    data = request.get_json(silent=True) or {}
-    first_name = str(data.get("first_name", "")).strip()
-    last_name = str(data.get("last_name", "")).strip()
-    email = str(data.get("email", "")).strip().lower()
-    mobile = str(data.get("mobile", "")).strip()
-    password = str(data.get("password", ""))
-    confirm_password = str(data.get("confirm_password", ""))
-
-    if not first_name or not last_name:
-        return jsonify({"success": False, "message": "Please enter your first and last name."}), 400
-    if not is_valid_email(email):
-        return jsonify({"success": False, "message": "Please enter a valid email address."}), 400
-    if not is_valid_mobile(mobile):
-        return jsonify({"success": False, "message": "Please enter a valid mobile number."}), 400
-    if not is_valid_password(password):
-        return jsonify({"success": False, "message": "Password must be at least 8 characters and include a letter and a number."}), 400
-    if password != confirm_password:
-        return jsonify({"success": False, "message": "Passwords do not match."}), 400
-
-    with USERS_LOCK:
-        if email in USERS:
-            return jsonify({"success": False, "message": "This email is already registered."}), 409
-        USERS[email] = {
-            "first_name": first_name, "last_name": last_name, "email": email,
-            "mobile": mobile, "password_hash": hash_password(password),
-        }
-
-    token = create_signed_token({"email": email})
-    logger.info("New registration: %s", email)
-
-    return jsonify({"success": True, "token": token, "first_name": first_name, "last_name": last_name, "email": email})
-
-
-@app.route("/api/login", methods=["POST", "OPTIONS"])
-def login():
-    if request.method == "OPTIONS":
-        return "", 200
-
-    data = request.get_json(silent=True) or {}
-    email = str(data.get("email", "")).strip().lower()
-    password = str(data.get("password", ""))
-
-    if not email or not password:
-        return jsonify({"success": False, "message": "Please enter your email and password."}), 400
-
-    with USERS_LOCK:
-        user = USERS.get(email)
-
-    if not user or not verify_password(password, user["password_hash"]):
-        return jsonify({"success": False, "message": "Invalid email or password."}), 401
-
-    token = create_signed_token({"email": email})
-    logger.info("Successful login: %s", email)
-
+    status = get_market_status()
+    if status == "closed":
+        return jsonify({
+            "success": True,
+            "market_status": "closed",
+            "message": "MARKET CLOSED",
+        })
     return jsonify({
-        "success": True, "token": token,
-        "first_name": user["first_name"], "last_name": user["last_name"], "email": user["email"],
+        "success": True,
+        "market_status": "open",
+        "message": "MARKET OPEN",
     })
 
-
-# ----------------------------------------------------------------------------
-# SIGNAL ROUTE  (requires login, Single Pair Mode or Auto Scanning Mode)
-# ----------------------------------------------------------------------------
-
-@app.route("/api/generate-signal", methods=["POST", "OPTIONS"])
-def generate_signal():
-    if request.method == "OPTIONS":
-        return "", 200
-
-    auth_payload = require_user_auth()
-    if not auth_payload:
-        return jsonify({"success": False, "message": "Please log in to generate signals."}), 401
-
-    data = request.get_json(silent=True) or {}
-    pair = str(data.get("pair", "")).strip()
-    timeframe = str(data.get("timeframe", "")).strip()
-    auto_scan = bool(data.get("auto_scan", False))
-
-    if timeframe not in TIMEFRAME_MAP:
-        return jsonify({"success": False, "message": "Unsupported timeframe."}), 400
-    if not auto_scan and pair not in SUPPORTED_PAIRS:
-        return jsonify({"success": False, "message": "Unsupported currency pair."}), 400
-
-    if get_market_status() == "closed":
-        return jsonify({"success": False, "market_status": "closed", "message": "Market Closed"}), 200
-
-    interval = TIMEFRAME_MAP[timeframe]
-    pairs_to_scan = list(SUPPORTED_PAIRS.items()) if auto_scan else [(pair, SUPPORTED_PAIRS[pair])]
-
-    best = None  # (votes, pair_label, confirmations, signal, confidence, candles, highs, lows, closes, symbol)
-    last_error = None
-
-    for pair_label, symbol in pairs_to_scan:
-        try:
-            confirmations, signal, confidence, votes, candles, highs, lows, closes = analyze_pair(symbol, interval)
-        except AllApiKeysExhaustedError as exc:
-            last_error = str(exc)
-            break
-        except MarketDataError as exc:
-            last_error = str(exc)
-            continue
-
-        if best is None or votes > best[0]:
-            best = (votes, pair_label, confirmations, signal, confidence, candles, highs, lows, closes, symbol)
-
-        # In auto-scan mode, stop early only if we already found a pair that
-        # actually clears the strict threshold with the maximum possible votes.
-        if not auto_scan:
-            break
-        if votes >= TOTAL_CONFIRMATIONS:
-            break
-
-    if best is None:
-        if isinstance(last_error, str) and "limit" in last_error.lower():
-            return jsonify({"success": False, "message": last_error}), 503
-        return jsonify({"success": False, "message": last_error or "Could not fetch market data. Please try again."}), 502
-
-    votes, pair_label, confirmations, signal, confidence, candles, highs, lows, closes, symbol = best
-    last_candle = candles[-1]
-    nxt_time = next_candle_time(last_candle["datetime"], interval)
-    levels = compute_levels(candles, highs, lows, closes, signal, symbol)
-
-    logger.info("Signal generated | user=%s pair=%s tf=%s signal=%s confidence=%s votes=%s/%s auto_scan=%s",
-                auth_payload.get("email"), pair_label, timeframe, signal, confidence, votes, TOTAL_CONFIRMATIONS, auto_scan)
-
-    return jsonify({
-        "success": True, "market_status": "open", "pair": pair_label, "timeframe": timeframe,
-        "auto_scan": auto_scan, "signal": signal, "confidence": confidence,
-        "votes": votes, "total_confirmations": TOTAL_CONFIRMATIONS,
-        "next_candle_time": nxt_time.isoformat(), "last_closed_candle_time": last_candle["datetime"].isoformat(),
-        "confirmations": confirmations, "levels": levels,
-    })
-
-
-
-# ============================================================================
-# R FX EXTENSION: fixed 1-minute / all-13-pair auto scanner
-# ============================================================================
-_EXTENSION_SCAN_LOCK = threading.Lock()
 
 @app.route("/api/extension/scan", methods=["POST", "OPTIONS"])
 def extension_scan():
-    """
-    Chrome Extension API.
-
-    IMPORTANT:
-    - No account login is required here by design.
-    - Uses the EXISTING strategy functions unchanged:
-        analyze_pair() -> evaluate_confirmations() -> build_signal()
-    - Timeframe is ALWAYS 1 minute.
-    - All 13 supported pairs are scanned.
-    - Only a signal with >= 9/11 votes is considered valid.
-    - The strongest valid pair is returned.
-    """
     if request.method == "OPTIONS":
         return "", 204
 
-    server_now = datetime.now(timezone.utc)
-
-    if get_market_status() == "closed":
+    status = get_market_status()
+    if status == "closed":
         return jsonify({
             "success": True,
             "market_status": "closed",
             "selected": False,
-            "message": "MARKET CLOSED",
+            "signal": "WAIT FOR BETTER SETUP",
             "display_signal": "WAIT",
-            "pair": None,
-            "timeframe": "1",
-            "timeframe_label": "1 min",
-            "server_time_utc": server_now.isoformat(),
-        }), 200
+            "message": "MARKET CLOSED",
+        })
 
-    if not TWELVEDATA_API_KEYS:
-        return jsonify({
-            "success": False,
-            "market_status": "open",
-            "message": "TwelveData API keys are not configured on Railway.",
-        }), 503
+    rotator.reset_cycle()
 
-    if not _EXTENSION_SCAN_LOCK.acquire(blocking=False):
-        return jsonify({
-            "success": False,
-            "message": "A scan is already running. Please wait.",
-        }), 429
+    results = []
+    for pair in PAIRS:
+        candles, err = fetch_candles(pair)
 
-    try:
-        interval = TIMEFRAME_MAP["1"]
-        best = None
-        results = []
-        errors = []
-
-        # EXACTLY the existing 13-pair list.
-        for pair_label, symbol in SUPPORTED_PAIRS.items():
-            try:
-                (
-                    confirmations,
-                    signal,
-                    confidence,
-                    votes,
-                    candles,
-                    highs,
-                    lows,
-                    closes,
-                ) = analyze_pair(symbol, interval)
-
-            except AllApiKeysExhaustedError as exc:
-                logger.error("Extension scan: all API keys exhausted: %s", exc)
-                return jsonify({
-                    "success": False,
-                    "market_status": "open",
-                    "message": str(exc),
-                    "server_time_utc": datetime.now(timezone.utc).isoformat(),
-                }), 503
-
-            except MarketDataError as exc:
-                errors.append({
-                    "pair": pair_label,
-                    "error": str(exc),
-                })
-                continue
-
-            except Exception as exc:
-                logger.exception(
-                    "Unexpected extension scan error for %s",
-                    pair_label,
-                )
-                errors.append({
-                    "pair": pair_label,
-                    "error": "Unexpected analysis error.",
-                })
-                continue
-
-            valid = (
-                signal in ("BUY", "SELL")
-                and votes >= SIGNAL_VOTE_THRESHOLD
-            )
-
-            display_signal = (
-                "UP" if signal == "BUY"
-                else "DOWN" if signal == "SELL"
-                else "WAIT"
-            )
-
-            last_candle_time = (
-                candles[-1]["datetime"].isoformat()
-                if candles
-                else None
-            )
-
-            results.append({
-                "pair": pair_label,
-                "signal": signal,
-                "display_signal": display_signal,
-                "votes": votes,
-                "total_confirmations": TOTAL_CONFIRMATIONS,
-                "confidence": confidence,
-                "valid": valid,
-                "last_closed_candle_time": last_candle_time,
-            })
-
-            if valid:
-                candidate = (
-                    votes,
-                    confidence,
-                    pair_label,
-                    signal,
-                    confirmations,
-                    candles,
-                    highs,
-                    lows,
-                    closes,
-                    symbol,
-                )
-
-                # Strongest vote count wins.
-                # Confidence is the tie-breaker.
-                if (
-                    best is None
-                    or votes > best[0]
-                    or (
-                        votes == best[0]
-                        and confidence > best[1]
-                    )
-                ):
-                    best = candidate
-
-        scan_time = datetime.now(timezone.utc)
-
-        if best is None:
+        if err == "ALL TWELVEDATA API KEYS EXHAUSTED":
             return jsonify({
-                "success": True,
-                "market_status": "open",
-                "selected": False,
-                "message": "WAIT FOR BETTER SETUP",
-                "display_signal": "WAIT",
-                "pair": None,
-                "signal": "WAIT FOR BETTER SETUP",
-                "votes": 0,
-                "total_confirmations": TOTAL_CONFIRMATIONS,
-                "confidence": 0,
-                "timeframe": "1",
-                "timeframe_label": "1 min",
-                "server_time_utc": scan_time.isoformat(),
-                "results": results,
-                "errors": errors,
+                "success": False,
+                "error": "ALL TWELVEDATA API KEYS EXHAUSTED",
             }), 200
 
-        (
-            votes,
-            confidence,
-            pair_label,
-            signal,
-            confirmations,
-            candles,
-            highs,
-            lows,
-            closes,
-            symbol,
-        ) = best
+        if err is not None or candles is None:
+            continue
 
-        last_candle = candles[-1]
-        last_closed_candle_time = last_candle["datetime"]
-        next_time = next_candle_time(
-            last_closed_candle_time,
-            interval,
-        )
+        if len(candles) < MIN_VALID_CANDLES:
+            continue
 
-        display_signal = (
-            "UP" if signal == "BUY"
-            else "DOWN"
-        )
+        result = evaluate_pair(pair, candles)
+        results.append(result)
 
-        # Stable ID the extension can use to prevent duplicate trades.
-        signal_key = (
-            f"{pair_label}|"
-            f"{last_closed_candle_time.isoformat()}|"
-            f"{signal}|"
-            f"{votes}"
-        )
+    tradable = [r for r in results if r["direction"] in ("BUY", "SELL")]
 
-        logger.info(
-            "EXTENSION SIGNAL | pair=%s tf=1min signal=%s "
-            "votes=%s/%s confidence=%s candle=%s",
-            pair_label,
-            signal,
-            votes,
-            TOTAL_CONFIRMATIONS,
-            confidence,
-            last_closed_candle_time.isoformat(),
-        )
-
+    if not tradable:
         return jsonify({
             "success": True,
             "market_status": "open",
-            "selected": True,
-            "pair": pair_label,
-            "signal": signal,
-            "display_signal": display_signal,
-            "confidence": confidence,
-            "votes": votes,
-            "total_confirmations": TOTAL_CONFIRMATIONS,
+            "selected": False,
+            "signal": "WAIT FOR BETTER SETUP",
+            "display_signal": "WAIT",
             "timeframe": "1",
             "timeframe_label": "1 min",
-            "last_closed_candle_time": last_closed_candle_time.isoformat(),
-            "next_candle_time": next_time.isoformat(),
-            "server_time_utc": scan_time.isoformat(),
-            "signal_key": signal_key,
-            "confirmations": confirmations,
-            "levels": compute_levels(
-                candles,
-                highs,
-                lows,
-                closes,
-                signal,
-                symbol,
-            ),
-            "results": results,
-            "errors": errors,
-        }), 200
+            "scanned_pairs": len(results),
+        })
 
-    finally:
-        _EXTENSION_SCAN_LOCK.release()
+    # Priority: highest votes first, confidence as tie-breaker
+    tradable.sort(key=lambda r: (r["votes"], r["confidence"]), reverse=True)
+    best = tradable[0]
 
+    signal_key = make_signal_key(
+        best["pair"], best["last_closed_candle_time"], best["direction"], best["votes"]
+    )
+    next_candle = next_candle_time_str(best["last_closed_candle_time"])
 
-@app.errorhandler(404)
-def not_found(_e):
-    return jsonify({"success": False, "message": "Endpoint not found."}), 404
+    display_signal = "UP" if best["direction"] == "BUY" else "DOWN"
 
-
-@app.errorhandler(500)
-def server_error(e):
-    logger.exception("Unhandled server error: %s", e)
-    return jsonify({"success": False, "message": "Internal server error."}), 500
+    return jsonify({
+        "success": True,
+        "market_status": "open",
+        "selected": True,
+        "pair": best["pair"],
+        "signal": best["direction"],
+        "display_signal": display_signal,
+        "votes": best["votes"],
+        "total_confirmations": TOTAL_CONFIRMATIONS,
+        "confidence": best["confidence"],
+        "timeframe": "1",
+        "timeframe_label": "1 min",
+        "last_closed_candle_time": best["last_closed_candle_time"],
+        "next_candle_time": next_candle,
+        "signal_key": signal_key,
+        "confirmations": best["confirmations"],
+    })
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    logger.info("Starting R Fx Bot backend on 0.0.0.0:%s", port)
-    app.run(host="0.0.0.0", port=port, debug=False)
+    PORT = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=PORT)
