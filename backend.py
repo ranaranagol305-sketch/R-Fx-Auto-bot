@@ -91,12 +91,15 @@ class KeyRotator:
             return self.keys[self.index]
 
     def reset_cycle(self):
-        # Called at the start of every fresh scan batch so a previous
-        # exhaustion event doesn't permanently lock the bot out after
-        # TwelveData's per-minute/day limits reset.
+        # Called at the start of every fresh scan batch. Only clears the
+        # "exhausted this minute" tracking - it deliberately does NOT reset
+        # index back to 0. Resetting the index every scan meant key #1 was
+        # hammered on every single scan (draining its daily quota fast)
+        # while the other 9 keys sat mostly idle. Keeping the index means
+        # each new scan continues rotating to the next key, spreading daily
+        # usage evenly across all 10 keys.
         with self.lock:
             self.exhausted = set()
-            self.index = 0
 
 
 rotator = KeyRotator(TWELVEDATA_API_KEYS)
