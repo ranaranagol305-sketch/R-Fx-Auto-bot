@@ -21,9 +21,13 @@ from flask import Flask, jsonify, request
 # ============================================================
 
 # Deriv only needs an app_id to identify the application - not an account
-# API token - for public market data like candles. This is the App ID from
-# your registered "R Forex bot auto" application on developers.deriv.com.
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "348SAcF6uOjuY9HH7P6MK")
+# API token - for public market data like candles. Using Deriv's own
+# public/shared app_id (1089) here - it's officially meant for testing and
+# market-data use with the legacy WebSocket API (wss://ws.derivws.com),
+# which is what this backend talks to. The newer alphanumeric app IDs from
+# developers.deriv.com's redesigned portal are for a different (REST-based)
+# API and are NOT accepted here - that's what caused "InvalidAppID".
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 # TwelveData kept as a fallback/backup source - if Deriv can't return data
