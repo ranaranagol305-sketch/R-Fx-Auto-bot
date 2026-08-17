@@ -21,11 +21,9 @@ from flask import Flask, jsonify, request
 # ============================================================
 
 # Deriv only needs an app_id to identify the application - not an account
-# API token - for public market data like candles. Note: Deriv app_ids are
-# normally purely numeric (e.g. 1089, 36300) - if this one doesn't work,
-# double check the numeric "App ID" shown on your app's page at
-# https://developers.deriv.com/dashboard
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "347bUdJSAQ1kxgHmRUkGP")
+# API token - for public market data like candles. This is the App ID from
+# your registered "R Forex bot auto" application on developers.deriv.com.
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "348SAcF6uOjuY9HH7P6MK")
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 # TwelveData kept as a fallback/backup source - if Deriv can't return data
