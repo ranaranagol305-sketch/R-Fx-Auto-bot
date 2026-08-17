@@ -40,8 +40,8 @@ if env_keys:
 TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
 
 PAIRS = [
-    "XAU/USD", "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
-    "AUD/USD", "NZD/USD", "USD/CAD", "EUR/JPY", "GBP/JPY",
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+    "AUD/USD", "USD/CAD", "EUR/JPY", "GBP/JPY",
     "EUR/GBP", "EUR/AUD", "AUD/JPY",
 ]
 
@@ -49,7 +49,7 @@ TIMEFRAME = "1min"
 OUTPUT_SIZE = 260
 MIN_VALID_CANDLES = 210
 TOTAL_CONFIRMATIONS = 11
-MIN_VOTES_TO_TRADE = 9
+MIN_VOTES_TO_TRADE = 10
 
 app = Flask(__name__)
 
