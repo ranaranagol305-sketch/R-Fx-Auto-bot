@@ -1,25 +1,36 @@
 """
 R Fx Bot - Backend
-Flask + TwelveData real OHLCV data + 11-confirmation strategy engine.
+Flask + Deriv WebSocket real OHLCV data + 11-confirmation strategy engine.
 
 No fake data. No random candles. No forced signals.
 """
 
 import os
+import json
+import hashlib
 import time
 import threading
-import hashlib
 from datetime import datetime, timezone
 
 import requests
+import websocket  # pip install websocket-client
 from flask import Flask, jsonify, request
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-# Put your 10 TwelveData API keys here (or set env var TWELVEDATA_API_KEYS
-# as a comma-separated list — that takes priority if present).
+# Deriv only needs an app_id to identify the application - not an account
+# API token - for public market data like candles. Note: Deriv app_ids are
+# normally purely numeric (e.g. 1089, 36300) - if this one doesn't work,
+# double check the numeric "App ID" shown on your app's page at
+# https://developers.deriv.com/dashboard
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "347bUdJSAQ1kxgHmRUkGP")
+DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+
+# TwelveData kept as a fallback/backup source - if Deriv can't return data
+# for a pair (connection issue, symbol problem, etc.) the bot retries that
+# pair against TwelveData before giving up on it for this scan.
 TWELVEDATA_API_KEYS = [
     "c47e6aa1e3694d888ba0d8ee10193160",
     "5f98e9f032684d27b8b266656bfcadac",
@@ -39,13 +50,22 @@ if env_keys:
 
 TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
 
-PAIRS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
-    "AUD/USD", "USD/CAD", "EUR/JPY", "GBP/JPY",
-    "EUR/GBP", "EUR/AUD", "AUD/JPY",
-]
+# Display name -> Deriv forex symbol (TwelveData fallback uses the display
+# name directly, e.g. "EUR/USD", since that's its own native format)
+PAIRS = {
+    "EUR/USD": "frxEURUSD",
+    "GBP/USD": "frxGBPUSD",
+    "USD/JPY": "frxUSDJPY",
+    "USD/CHF": "frxUSDCHF",
+    "AUD/USD": "frxAUDUSD",
+    "USD/CAD": "frxUSDCAD",
+    "EUR/JPY": "frxEURJPY",
+    "GBP/JPY": "frxGBPJPY",
+    "EUR/GBP": "frxEURGBP",
+    "EUR/AUD": "frxEURAUD",
+    "AUD/JPY": "frxAUDJPY",
+}
 
-TIMEFRAME = "1min"
 OUTPUT_SIZE = 260
 MIN_VALID_CANDLES = 210
 TOTAL_CONFIRMATIONS = 11
@@ -62,7 +82,7 @@ def add_cors_headers(response):
     return response
 
 # ============================================================
-# API KEY ROTATION
+# TWELVEDATA FALLBACK (REST + key rotation)
 # ============================================================
 
 class KeyRotator:
@@ -91,22 +111,14 @@ class KeyRotator:
             return self.keys[self.index]
 
     def reset_cycle(self):
-        # Called at the start of every fresh scan batch. Only clears the
-        # "exhausted this minute" tracking - it deliberately does NOT reset
-        # index back to 0. Resetting the index every scan meant key #1 was
-        # hammered on every single scan (draining its daily quota fast)
-        # while the other 9 keys sat mostly idle. Keeping the index means
-        # each new scan continues rotating to the next key, spreading daily
-        # usage evenly across all 10 keys.
+        # Does NOT reset index back to 0 - only clears "exhausted this
+        # minute" tracking, so consecutive scans keep rotating through
+        # different keys instead of hammering key #1 every time.
         with self.lock:
             self.exhausted = set()
 
 
 rotator = KeyRotator(TWELVEDATA_API_KEYS)
-
-# Track last executed signal_key to enforce one-trade-per-candle (server side too)
-_last_signal_keys = {}
-_signal_lock = threading.Lock()
 
 
 def is_key_error(status_code, payload):
@@ -123,11 +135,9 @@ def is_key_error(status_code, payload):
     return False
 
 
-def fetch_candles(pair):
-    """Fetch real OHLCV candles from TwelveData with automatic key rotation.
-    Returns (candles_list, error_string_or_None).
-    candles_list is a list of dicts sorted ASC by time, oldest first.
-    """
+def fetch_candles_twelvedata(pair):
+    """Fallback fetch for a single pair via TwelveData REST, with key
+    rotation. Returns (candles_list_or_None, error_string_or_None)."""
     attempts = 0
     max_attempts = len(rotator.keys)
 
@@ -138,7 +148,7 @@ def fetch_candles(pair):
 
         params = {
             "symbol": pair,
-            "interval": TIMEFRAME,
+            "interval": "1min",
             "outputsize": OUTPUT_SIZE,
             "apikey": key,
             "order": "ASC",
@@ -147,12 +157,12 @@ def fetch_candles(pair):
         try:
             resp = requests.get(TWELVEDATA_URL, params=params, timeout=15)
         except requests.RequestException as e:
-            return None, f"API ERROR: {e}"
+            return None, f"TWELVEDATA API ERROR: {e}"
 
         try:
             data = resp.json()
         except ValueError:
-            return None, "API ERROR: invalid response"
+            return None, "TWELVEDATA API ERROR: invalid response"
 
         if isinstance(data, dict) and data.get("status") == "error":
             if is_key_error(resp.status_code, data):
@@ -161,11 +171,11 @@ def fetch_candles(pair):
                 if nxt is None:
                     return None, "ALL TWELVEDATA API KEYS EXHAUSTED"
                 continue
-            return None, f"API ERROR: {data.get('message', 'unknown error')}"
+            return None, f"TWELVEDATA API ERROR: {data.get('message', 'unknown error')}"
 
         values = data.get("values") if isinstance(data, dict) else None
         if not values:
-            return None, "API ERROR: no data returned"
+            return None, "TWELVEDATA API ERROR: no data returned"
 
         candles = []
         for v in values:
@@ -184,6 +194,116 @@ def fetch_candles(pair):
         return candles, None
 
     return None, "ALL TWELVEDATA API KEYS EXHAUSTED"
+
+
+# ============================================================
+# DERIV MARKET DATA (public - no account token required) - PRIMARY
+# ============================================================
+
+# Track last executed signal_key to enforce one-trade-per-candle (server side too)
+_last_signal_keys = {}
+
+
+def fetch_all_candles(pairs_map):
+    """Fetch 1-minute candles for every pair over a single Deriv WebSocket
+    connection (one request per pair, correlated by req_id). Returns a dict
+    of display_name -> (candles_list_or_None, error_string_or_None).
+    Never fabricates data - any pair that errors or times out is skipped.
+    """
+    results = {}
+
+    try:
+        ws = websocket.create_connection(DERIV_WS_URL, timeout=15)
+    except Exception as e:
+        return {name: (None, f"DERIV CONNECTION FAILED: {e}") for name in pairs_map}
+
+    req_id_map = {}
+    try:
+        for i, (name, symbol) in enumerate(pairs_map.items()):
+            req_id = i + 1
+            req_id_map[req_id] = name
+            req = {
+                "ticks_history": symbol,
+                "adjust_start_time": 1,
+                "count": OUTPUT_SIZE,
+                "end": "latest",
+                "start": 1,
+                "style": "candles",
+                "granularity": 60,  # 1 minute
+                "req_id": req_id,
+            }
+            ws.send(json.dumps(req))
+
+        pending = set(req_id_map.keys())
+        deadline = time.time() + 30
+
+        while pending and time.time() < deadline:
+            try:
+                raw = ws.recv()
+            except Exception as e:
+                break
+
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                continue
+
+            rid = data.get("req_id")
+            if rid not in pending:
+                continue
+
+            name = req_id_map[rid]
+            pending.discard(rid)
+
+            if data.get("error"):
+                results[name] = (None, f"DERIV API ERROR: {data['error'].get('message', 'unknown error')}")
+                continue
+
+            candles_raw = data.get("candles")
+            if not candles_raw:
+                results[name] = (None, "DERIV API ERROR: no candle data returned")
+                continue
+
+            candles = []
+            for c in candles_raw:
+                try:
+                    candles.append({
+                        "time": datetime.fromtimestamp(int(c["epoch"]), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "open": float(c["open"]),
+                        "high": float(c["high"]),
+                        "low": float(c["low"]),
+                        "close": float(c["close"]),
+                        # Deriv does not provide real traded volume for forex
+                        # (it's an OTC market) - leave unset rather than
+                        # inventing a number. The volume confirmation in the
+                        # strategy already treats missing volume as NEUTRAL.
+                        "volume": None,
+                    })
+                except (KeyError, ValueError, TypeError):
+                    continue
+            results[name] = (candles, None)
+
+        for rid in pending:
+            results[req_id_map[rid]] = (None, "DERIV API ERROR: timed out waiting for response")
+
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    # Fallback: for any pair Deriv couldn't supply, retry via TwelveData.
+    rotator.reset_cycle()
+    for name in pairs_map:
+        candles, err = results.get(name, (None, "no result"))
+        if candles is not None:
+            continue  # Deriv already succeeded for this pair
+        fallback_candles, fallback_err = fetch_candles_twelvedata(name)
+        if fallback_candles is not None:
+            results[name] = (fallback_candles, None)
+        # else: keep the original Deriv error - both sources failed
+
+    return results
 
 
 # ============================================================
@@ -685,17 +805,20 @@ def extension_scan():
             "message": "MARKET CLOSED",
         })
 
-    rotator.reset_cycle()
+    fetch_results = fetch_all_candles(PAIRS)
+
+    # If every single pair failed (e.g. Deriv connection down entirely),
+    # surface that clearly instead of silently returning WAIT.
+    if all(err is not None for _, err in fetch_results.values()):
+        first_error = next(iter(fetch_results.values()))[1]
+        return jsonify({
+            "success": False,
+            "error": first_error or "DERIV CONNECTION FAILED",
+        }), 200
 
     results = []
     for pair in PAIRS:
-        candles, err = fetch_candles(pair)
-
-        if err == "ALL TWELVEDATA API KEYS EXHAUSTED":
-            return jsonify({
-                "success": False,
-                "error": "ALL TWELVEDATA API KEYS EXHAUSTED",
-            }), 200
+        candles, err = fetch_results.get(pair, (None, "DERIV API ERROR: no response"))
 
         if err is not None or candles is None:
             continue
