@@ -47,8 +47,8 @@ PAIRS = [
 TIMEFRAME = "1min"
 OUTPUT_SIZE = 260
 MIN_VALID_CANDLES = 210
-TOTAL_CONFIRMATIONS = 11
-MIN_VOTES_TO_TRADE = 10
+TOTAL_CONFIRMATIONS = 6
+MIN_VOTES_TO_TRADE = 5
 
 app = Flask(__name__)
 
@@ -440,10 +440,23 @@ def evaluate_pair(pair, candles):
     closes = [c["close"] for c in candles]
     highs = [c["high"] for c in candles]
     lows = [c["low"] for c in candles]
-    volumes = [c["volume"] for c in candles]
 
     n = len(closes)
     votes = {}
+
+    # ---- ATR pre-filter (not a vote) ----
+    # Blocks trading when current volatility is unusually low compared to
+    # its own recent average for this pair - i.e. a dead/ranging market
+    # where even a "5/6 agree" signal is more likely to be noise.
+    atr_vals = atr(highs, lows, closes, 14)
+    atr_ok = False
+    if atr_vals[-1] is not None:
+        recent = [v for v in atr_vals[-21:-1] if v is not None]
+        if recent:
+            avg_recent_atr = sum(recent) / len(recent)
+            atr_ok = avg_recent_atr <= 0 or atr_vals[-1] >= 0.7 * avg_recent_atr
+        else:
+            atr_ok = True  # not enough history yet - don't block on this alone
 
     # 1. Market Structure
     votes["market_structure"] = market_structure(highs, lows)
@@ -478,20 +491,7 @@ def evaluate_pair(pair, candles):
     else:
         votes["ema50"] = "NEUTRAL"
 
-    # 4. RSI
-    rsi_vals = rsi(closes, 14)
-    if rsi_vals[-1] is not None and rsi_vals[-2] is not None:
-        r, prev_r = rsi_vals[-1], rsi_vals[-2]
-        if r > 55 and r >= prev_r:
-            votes["rsi"] = "BUY"
-        elif r < 45 and r <= prev_r:
-            votes["rsi"] = "SELL"
-        else:
-            votes["rsi"] = "NEUTRAL"
-    else:
-        votes["rsi"] = "NEUTRAL"
-
-    # 5. MACD
+    # 4. MACD
     macd_line, signal_line, hist = macd(closes)
     if macd_line[-1] is not None and signal_line[-1] is not None and hist[-1] is not None:
         if macd_line[-1] > signal_line[-1] and hist[-1] > 0:
@@ -503,7 +503,7 @@ def evaluate_pair(pair, candles):
     else:
         votes["macd"] = "NEUTRAL"
 
-    # 6. ADX
+    # 5. ADX + DI
     adx_line, plus_di, minus_di = adx(highs, lows, closes, 14)
     if adx_line[-1] is not None and plus_di[-1] is not None and minus_di[-1] is not None:
         if adx_line[-1] >= 20 and plus_di[-1] > minus_di[-1]:
@@ -515,46 +515,7 @@ def evaluate_pair(pair, candles):
     else:
         votes["adx"] = "NEUTRAL"
 
-    # 7. ATR (movement filter)
-    atr_vals = atr(highs, lows, closes, 14)
-    if atr_vals[-1] is not None and n >= 2:
-        move = closes[-1] - closes[-2]
-        if move > 0.5 * atr_vals[-1]:
-            votes["atr"] = "BUY"
-        elif move < -0.5 * atr_vals[-1]:
-            votes["atr"] = "SELL"
-        else:
-            votes["atr"] = "NEUTRAL"
-    else:
-        votes["atr"] = "NEUTRAL"
-
-    # 8. Bollinger Bands
-    bb_upper, bb_mid, bb_lower = bollinger(closes, 20, 2)
-    if bb_upper[-1] is not None and bb_mid[-1] is not None and bb_lower[-1] is not None:
-        c = closes[-1]
-        if c > bb_mid[-1] and c < bb_upper[-1]:
-            votes["bollinger"] = "BUY"
-        elif c < bb_mid[-1] and c > bb_lower[-1]:
-            votes["bollinger"] = "SELL"
-        else:
-            votes["bollinger"] = "NEUTRAL"
-    else:
-        votes["bollinger"] = "NEUTRAL"
-
-    # 9. Stochastic
-    stoch_k, stoch_d = stochastic(highs, lows, closes, 14, 3)
-    if stoch_k[-1] is not None and stoch_d[-1] is not None:
-        k, d = stoch_k[-1], stoch_d[-1]
-        if k > d and k < 80:
-            votes["stochastic"] = "BUY"
-        elif k < d and k > 20:
-            votes["stochastic"] = "SELL"
-        else:
-            votes["stochastic"] = "NEUTRAL"
-    else:
-        votes["stochastic"] = "NEUTRAL"
-
-    # 10. SuperTrend
+    # 6. SuperTrend
     st = supertrend(highs, lows, closes, 10, 3)
     if st[-1] == 1:
         votes["supertrend"] = "BUY"
@@ -563,26 +524,14 @@ def evaluate_pair(pair, candles):
     else:
         votes["supertrend"] = "NEUTRAL"
 
-    # 11. Volume
-    usable_volume = all(v is not None and v > 0 for v in volumes[-21:]) if n >= 21 else False
-    if usable_volume:
-        avg_vol = sum(volumes[-21:-1]) / 20
-        cur_vol = volumes[-1]
-        price_up = closes[-1] > closes[-2]
-        price_down = closes[-1] < closes[-2]
-        if cur_vol > avg_vol and price_up:
-            votes["volume"] = "BUY"
-        elif cur_vol > avg_vol and price_down:
-            votes["volume"] = "SELL"
-        else:
-            votes["volume"] = "NEUTRAL"
-    else:
-        votes["volume"] = "NEUTRAL"
-
     buy_votes = sum(1 for v in votes.values() if v == "BUY")
     sell_votes = sum(1 for v in votes.values() if v == "SELL")
 
-    if buy_votes >= MIN_VOTES_TO_TRADE and buy_votes > sell_votes:
+    if not atr_ok:
+        # Volatility too low right now - don't trade even if votes agree.
+        direction = "WAIT"
+        vote_count = max(buy_votes, sell_votes)
+    elif buy_votes >= MIN_VOTES_TO_TRADE and buy_votes > sell_votes:
         direction = "BUY"
         vote_count = buy_votes
     elif sell_votes >= MIN_VOTES_TO_TRADE and sell_votes > buy_votes:
@@ -594,6 +543,9 @@ def evaluate_pair(pair, candles):
 
     confidence = round((vote_count / TOTAL_CONFIRMATIONS) * 100, 1)
 
+    confirmations_out = dict(votes)
+    confirmations_out["atr_filter"] = "PASS" if atr_ok else "BLOCKED (low volatility)"
+
     return {
         "pair": pair,
         "direction": direction,
@@ -601,7 +553,7 @@ def evaluate_pair(pair, candles):
         "buy_votes": buy_votes,
         "sell_votes": sell_votes,
         "confidence": confidence,
-        "confirmations": votes,
+        "confirmations": confirmations_out,
         "last_closed_candle_time": candles[-1]["time"],
     }
 
