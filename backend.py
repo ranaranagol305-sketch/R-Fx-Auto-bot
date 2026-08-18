@@ -57,11 +57,20 @@ PAIRS = [
     "EUR/GBP", "EUR/AUD", "AUD/JPY",
 ]
 
-TIMEFRAME = "1min"
+# Supported timeframes - all native TwelveData intervals, no aggregation
+# needed or invented data.
+TIMEFRAME_CONFIG = {
+    "1": {"fetch_interval": "1min", "label": "1 min"},
+    "5": {"fetch_interval": "5min", "label": "5 min"},
+    "15": {"fetch_interval": "15min", "label": "15 min"},
+    "30": {"fetch_interval": "30min", "label": "30 min"},
+}
+DEFAULT_TIMEFRAME = "1"
+
 OUTPUT_SIZE = 260
 MIN_VALID_CANDLES = 210
-TOTAL_CONFIRMATIONS = 11
-MIN_VOTES_TO_TRADE = 10
+TOTAL_CONFIRMATIONS = 10
+MIN_VOTES_TO_TRADE = 9
 
 app = Flask(__name__)
 
@@ -120,8 +129,8 @@ _last_signal_keys = {}
 
 # Per-pair 1-candle cooldown: after a pair is selected for a trade, it is
 # excluded from selection for the very next candle (even if it signals
-# again) - other pairs remain eligible. Maps pair -> epoch-minute of the
-# candle the trade was placed for.
+# again) - other pairs remain eligible. Maps (pair, timeframe_key) -> the
+# epoch-candle-index of the candle the trade was placed for.
 _pair_cooldown = {}
 _pair_cooldown_lock = threading.Lock()
 
@@ -140,9 +149,9 @@ def is_key_error(status_code, payload):
     return False
 
 
-def _fetch_with_rotator(pair, rotator_instance):
+def _fetch_with_rotator(pair, rotator_instance, interval):
     """Fetch real OHLCV candles from TwelveData using the given key
-    rotator. Returns (candles_list, error_string_or_None)."""
+    rotator and interval. Returns (candles_list, error_string_or_None)."""
     attempts = 0
     max_attempts = len(rotator_instance.keys)
 
@@ -153,7 +162,7 @@ def _fetch_with_rotator(pair, rotator_instance):
 
         params = {
             "symbol": pair,
-            "interval": TIMEFRAME,
+            "interval": interval,
             "outputsize": OUTPUT_SIZE,
             "apikey": key,
             "order": "ASC",
@@ -201,17 +210,19 @@ def _fetch_with_rotator(pair, rotator_instance):
     return None, "ALL TWELVEDATA API KEYS EXHAUSTED"
 
 
-def fetch_candles(pair):
+def fetch_candles(pair, timeframe_key=DEFAULT_TIMEFRAME):
     """Fetch candles trying the PRIMARY keys first. Only if every primary
     key is exhausted does it fall back to the SECONDARY (older) keys.
     Returns (candles_list, error_string_or_None).
     """
-    candles, err = _fetch_with_rotator(pair, primary_rotator)
+    interval = TIMEFRAME_CONFIG.get(timeframe_key, TIMEFRAME_CONFIG[DEFAULT_TIMEFRAME])["fetch_interval"]
+
+    candles, err = _fetch_with_rotator(pair, primary_rotator, interval)
     if candles is not None:
         return candles, None
 
     # Primary failed (exhausted or otherwise) - try secondary as fallback.
-    candles, err2 = _fetch_with_rotator(pair, secondary_rotator)
+    candles, err2 = _fetch_with_rotator(pair, secondary_rotator, interval)
     if candles is not None:
         return candles, None
 
@@ -587,17 +598,11 @@ def evaluate_pair(pair, candles):
     else:
         votes["macd"] = "NEUTRAL"
 
-    # 6. ADX
+    # ADX used as a gatekeeper filter, not a vote (see below after all
+    # votes are counted) - it only confirms whether a real trend exists,
+    # it doesn't have an opinion on direction like the others.
     adx_line, plus_di, minus_di = adx(highs, lows, closes, 14)
-    if adx_line[-1] is not None and plus_di[-1] is not None and minus_di[-1] is not None:
-        if adx_line[-1] >= 20 and plus_di[-1] > minus_di[-1]:
-            votes["adx"] = "BUY"
-        elif adx_line[-1] >= 20 and minus_di[-1] > plus_di[-1]:
-            votes["adx"] = "SELL"
-        else:
-            votes["adx"] = "NEUTRAL"
-    else:
-        votes["adx"] = "NEUTRAL"
+    adx_ok = adx_line[-1] is not None and adx_line[-1] >= 25
 
     # 7. ATR (movement filter)
     atr_vals = atr(highs, lows, closes, 14)
@@ -655,7 +660,13 @@ def evaluate_pair(pair, candles):
     buy_votes = sum(1 for v in votes.values() if v == "BUY")
     sell_votes = sum(1 for v in votes.values() if v == "SELL")
 
-    if buy_votes >= MIN_VOTES_TO_TRADE and buy_votes > sell_votes:
+    if not adx_ok:
+        # No real trend right now (ADX below threshold) - don't trade even
+        # if the other 10 indicators agree; sideways markets are exactly
+        # where trend-following indicators mislead each other.
+        direction = "WAIT"
+        vote_count = max(buy_votes, sell_votes)
+    elif buy_votes >= MIN_VOTES_TO_TRADE and buy_votes > sell_votes:
         direction = "BUY"
         vote_count = buy_votes
     elif sell_votes >= MIN_VOTES_TO_TRADE and sell_votes > buy_votes:
@@ -667,6 +678,9 @@ def evaluate_pair(pair, candles):
 
     confidence = round((vote_count / TOTAL_CONFIRMATIONS) * 100, 1)
 
+    confirmations_out = dict(votes)
+    confirmations_out["adx_filter"] = "PASS" if adx_ok else "BLOCKED (no clear trend)"
+
     return {
         "pair": pair,
         "direction": direction,
@@ -674,7 +688,7 @@ def evaluate_pair(pair, candles):
         "buy_votes": buy_votes,
         "sell_votes": sell_votes,
         "confidence": confidence,
-        "confirmations": votes,
+        "confirmations": confirmations_out,
         "last_closed_candle_time": candles[-1]["time"],
     }
 
@@ -684,11 +698,11 @@ def make_signal_key(pair, candle_time, direction, votes):
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def next_candle_time_str(last_closed_time):
+def next_candle_time_str(last_closed_time, candle_minutes=1):
     try:
         dt = datetime.strptime(last_closed_time, "%Y-%m-%d %H:%M:%S")
-        nxt = dt.replace(second=0) 
-        nxt = nxt.timestamp() + 60
+        nxt = dt.replace(second=0)
+        nxt = nxt.timestamp() + (candle_minutes * 60)
         return datetime.fromtimestamp(nxt, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
@@ -743,6 +757,13 @@ def extension_scan():
     if request.method == "OPTIONS":
         return "", 204
 
+    body = request.get_json(silent=True) or {}
+    timeframe_key = str(body.get("timeframe", DEFAULT_TIMEFRAME))
+    if timeframe_key not in TIMEFRAME_CONFIG:
+        timeframe_key = DEFAULT_TIMEFRAME
+    timeframe_label = TIMEFRAME_CONFIG[timeframe_key]["label"]
+    candle_minutes = int(timeframe_key)
+
     status = get_market_status()
     if status == "closed":
         return jsonify({
@@ -759,7 +780,7 @@ def extension_scan():
 
     results = []
     for pair in PAIRS:
-        candles, err = fetch_candles(pair)
+        candles, err = fetch_candles(pair, timeframe_key)
 
         if err == "ALL TWELVEDATA API KEYS EXHAUSTED":
             return jsonify({
@@ -779,12 +800,13 @@ def extension_scan():
     tradable = [r for r in results if r["direction"] in ("BUY", "SELL")]
 
     # Apply the 1-candle-per-pair cooldown: exclude any pair that was
-    # selected for a trade in the immediately preceding candle.
-    current_epoch_minute = int(time.time() // 60)
+    # selected for a trade in the immediately preceding candle (scaled to
+    # the selected timeframe's candle length).
+    current_epoch_candle = int(time.time() // (candle_minutes * 60))
     with _pair_cooldown_lock:
         tradable = [
             r for r in tradable
-            if _pair_cooldown.get(r["pair"]) != current_epoch_minute
+            if _pair_cooldown.get((r["pair"], timeframe_key)) != current_epoch_candle
         ]
 
     if not tradable:
@@ -794,8 +816,8 @@ def extension_scan():
             "selected": False,
             "signal": "WAIT FOR BETTER SETUP",
             "display_signal": "WAIT",
-            "timeframe": "1",
-            "timeframe_label": "1 min",
+            "timeframe": timeframe_key,
+            "timeframe_label": timeframe_label,
             "scanned_pairs": len(results),
         })
 
@@ -804,14 +826,14 @@ def extension_scan():
     best = tradable[0]
 
     # Record this pair as traded for the upcoming candle, so it's excluded
-    # from the very next scan's selection.
+    # from the very next scan's selection (per timeframe).
     with _pair_cooldown_lock:
-        _pair_cooldown[best["pair"]] = current_epoch_minute + 1
+        _pair_cooldown[(best["pair"], timeframe_key)] = current_epoch_candle + 1
 
     signal_key = make_signal_key(
         best["pair"], best["last_closed_candle_time"], best["direction"], best["votes"]
     )
-    next_candle = next_candle_time_str(best["last_closed_candle_time"])
+    next_candle = next_candle_time_str(best["last_closed_candle_time"], candle_minutes)
 
     display_signal = "UP" if best["direction"] == "BUY" else "DOWN"
 
@@ -825,8 +847,8 @@ def extension_scan():
         "votes": best["votes"],
         "total_confirmations": TOTAL_CONFIRMATIONS,
         "confidence": best["confidence"],
-        "timeframe": "1",
-        "timeframe_label": "1 min",
+        "timeframe": timeframe_key,
+        "timeframe_label": timeframe_label,
         "last_closed_candle_time": best["last_closed_candle_time"],
         "next_candle_time": next_candle,
         "signal_key": signal_key,
