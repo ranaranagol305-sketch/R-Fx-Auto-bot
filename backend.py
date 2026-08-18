@@ -6,6 +6,7 @@ No fake data. No random candles. No forced signals.
 """
 
 import os
+import time
 import hashlib
 import threading
 from datetime import datetime, timezone
@@ -103,6 +104,13 @@ rotator = KeyRotator(TWELVEDATA_API_KEYS)
 
 # Track last executed signal_key to enforce one-trade-per-candle (server side too)
 _last_signal_keys = {}
+
+# Per-pair 1-candle cooldown: after a pair is selected for a trade, it is
+# excluded from selection for the very next candle (even if it signals
+# again) - other pairs remain eligible. Maps pair -> epoch-minute of the
+# candle the trade was placed for.
+_pair_cooldown = {}
+_pair_cooldown_lock = threading.Lock()
 
 
 def is_key_error(status_code, payload):
@@ -656,6 +664,15 @@ def extension_scan():
 
     tradable = [r for r in results if r["direction"] in ("BUY", "SELL")]
 
+    # Apply the 1-candle-per-pair cooldown: exclude any pair that was
+    # selected for a trade in the immediately preceding candle.
+    current_epoch_minute = int(time.time() // 60)
+    with _pair_cooldown_lock:
+        tradable = [
+            r for r in tradable
+            if _pair_cooldown.get(r["pair"]) != current_epoch_minute
+        ]
+
     if not tradable:
         return jsonify({
             "success": True,
@@ -671,6 +688,11 @@ def extension_scan():
     # Priority: highest votes first, confidence as tie-breaker
     tradable.sort(key=lambda r: (r["votes"], r["confidence"]), reverse=True)
     best = tradable[0]
+
+    # Record this pair as traded for the upcoming candle, so it's excluded
+    # from the very next scan's selection.
+    with _pair_cooldown_lock:
+        _pair_cooldown[best["pair"]] = current_epoch_minute + 1
 
     signal_key = make_signal_key(
         best["pair"], best["last_closed_candle_time"], best["direction"], best["votes"]
