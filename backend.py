@@ -18,9 +18,17 @@ from flask import Flask, jsonify, request
 # CONFIG
 # ============================================================
 
-# 10 TwelveData API keys (or set env var TWELVEDATA_API_KEYS as a
-# comma-separated list - that takes priority if present).
-TWELVEDATA_API_KEYS = [
+# PRIMARY keys - tried first, always. Only when ALL of these are exhausted
+# (this scan cycle) does the bot fall back to the SECONDARY (older) keys.
+PRIMARY_TWELVEDATA_API_KEYS = [
+    "809e3b0e28e449b8842c2b88d629cfd3",
+    "6ac82d580f974cde9103dac7103dbc6f",
+    "e3bdf38ebb7a45d18284e7650e1b5466",
+]
+
+# SECONDARY (fallback) keys - the original 10, used only once every
+# primary key is exhausted.
+SECONDARY_TWELVEDATA_API_KEYS = [
     "c47e6aa1e3694d888ba0d8ee10193160",
     "5f98e9f032684d27b8b266656bfcadac",
     "a592dba7321442efa229bee2b8a1cff8",
@@ -33,9 +41,13 @@ TWELVEDATA_API_KEYS = [
     "56df4a80e020400db5259ec9485b2565",
 ]
 
-env_keys = os.environ.get("TWELVEDATA_API_KEYS")
-if env_keys:
-    TWELVEDATA_API_KEYS = [k.strip() for k in env_keys.split(",") if k.strip()]
+env_primary = os.environ.get("TWELVEDATA_PRIMARY_API_KEYS")
+if env_primary:
+    PRIMARY_TWELVEDATA_API_KEYS = [k.strip() for k in env_primary.split(",") if k.strip()]
+
+env_secondary = os.environ.get("TWELVEDATA_API_KEYS")
+if env_secondary:
+    SECONDARY_TWELVEDATA_API_KEYS = [k.strip() for k in env_secondary.split(",") if k.strip()]
 
 TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
 
@@ -100,7 +112,8 @@ class KeyRotator:
             self.exhausted = set()
 
 
-rotator = KeyRotator(TWELVEDATA_API_KEYS)
+primary_rotator = KeyRotator(PRIMARY_TWELVEDATA_API_KEYS)
+secondary_rotator = KeyRotator(SECONDARY_TWELVEDATA_API_KEYS)
 
 # Track last executed signal_key to enforce one-trade-per-candle (server side too)
 _last_signal_keys = {}
@@ -127,16 +140,14 @@ def is_key_error(status_code, payload):
     return False
 
 
-def fetch_candles(pair):
-    """Fetch real OHLCV candles from TwelveData with automatic key rotation.
-    Returns (candles_list, error_string_or_None).
-    candles_list is a list of dicts sorted ASC by time, oldest first.
-    """
+def _fetch_with_rotator(pair, rotator_instance):
+    """Fetch real OHLCV candles from TwelveData using the given key
+    rotator. Returns (candles_list, error_string_or_None)."""
     attempts = 0
-    max_attempts = len(rotator.keys)
+    max_attempts = len(rotator_instance.keys)
 
     while attempts < max_attempts:
-        key = rotator.current()
+        key = rotator_instance.current()
         if key is None:
             return None, "ALL TWELVEDATA API KEYS EXHAUSTED"
 
@@ -161,7 +172,7 @@ def fetch_candles(pair):
         if isinstance(data, dict) and data.get("status") == "error":
             if is_key_error(resp.status_code, data):
                 attempts += 1
-                nxt = rotator.rotate()
+                nxt = rotator_instance.rotate()
                 if nxt is None:
                     return None, "ALL TWELVEDATA API KEYS EXHAUSTED"
                 continue
@@ -188,6 +199,26 @@ def fetch_candles(pair):
         return candles, None
 
     return None, "ALL TWELVEDATA API KEYS EXHAUSTED"
+
+
+def fetch_candles(pair):
+    """Fetch candles trying the PRIMARY keys first. Only if every primary
+    key is exhausted does it fall back to the SECONDARY (older) keys.
+    Returns (candles_list, error_string_or_None).
+    """
+    candles, err = _fetch_with_rotator(pair, primary_rotator)
+    if candles is not None:
+        return candles, None
+
+    # Primary failed (exhausted or otherwise) - try secondary as fallback.
+    candles, err2 = _fetch_with_rotator(pair, secondary_rotator)
+    if candles is not None:
+        return candles, None
+
+    # Both exhausted/failed
+    if err == "ALL TWELVEDATA API KEYS EXHAUSTED" and err2 == "ALL TWELVEDATA API KEYS EXHAUSTED":
+        return None, "ALL TWELVEDATA API KEYS EXHAUSTED"
+    return None, err2 or err
 
 
 # ============================================================
@@ -641,7 +672,8 @@ def extension_scan():
             "message": "MARKET CLOSED",
         })
 
-    rotator.reset_cycle()
+    primary_rotator.reset_cycle()
+    secondary_rotator.reset_cycle()
 
     results = []
     for pair in PAIRS:
